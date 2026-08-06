@@ -239,6 +239,16 @@
   .srow .st{font-size:10.5px;font-weight:700;color:var(--muted)}
   .srow .st.ok{color:var(--teal)}
   .srow .st.ng{color:var(--warn)}
+  .scan .status{
+    padding:7px 14px; font-size:11.5px; font-weight:600; color:#fff;
+    background:#000; border-bottom:1px solid #222; text-align:center;
+  }
+  .scan .status.bad{color:#FF8A5B}
+  .scan .manual{display:flex;gap:8px;padding:8px 12px;background:var(--card);border-top:1px solid var(--rule)}
+  .scan .manual input{
+    flex:1;padding:8px 10px;border:1px solid var(--rule);border-radius:8px;
+    background:var(--paper);outline:none;font-size:15px;
+  }
 
   .empty{padding:60px 30px;text-align:center;color:var(--muted);font-size:13px;line-height:1.9}
   .toast{
@@ -494,7 +504,7 @@ function buildFromCsv(recs){
       owned:true, read:false,
       wanted:r['欲しい']==='1', ordered:r['注文した']==='1',
       rating:toInt(r['レート'])||0,
-      memo:r['メモ']||'', place:r['場所']||'',
+      memo:r['メモ']||'', place:r['場所']||'', coverUrl:'',
       tags:r['タグ']?r['タグ'].split(',').map(s=>s.trim()).filter(Boolean):[],
     });
   }
@@ -612,7 +622,53 @@ function removeSeries(id){
    5. 表紙
    ========================================================================== */
 const urlCache=new Map();
-const ndlUrl = isbn => `https://ndlsearch.ndl.go.jp/thumbnail/${isbn}.jpg`;
+const gbCache=new Map();          // ISBN → 書影URL（見つからなければ null）
+let gbQueue=Promise.resolve();    // 問い合わせは1件ずつ
+
+/* すぐ試せる候補。ここで見つからなければ Google Books に問い合わせる */
+function coverSources(isbn,known){
+  const list=[];
+  if(known) list.push(known);
+  list.push(`./covers/${isbn}_coverimage.png`);   // 手元の画像を置いた場合
+  if(!settings().remoteCovers) return list;
+  list.push(`https://cover.openbd.jp/${isbn}.jpg`);
+  list.push(`https://ndlsearch.ndl.go.jp/thumbnail/${isbn}.jpg`);
+  return list;
+}
+
+/* 書影URLを問い合わせる。楽天を優先し、無ければGoogle Books。
+   結果は本の情報に覚えさせるので、二度目以降は通信しない */
+function googleCover(isbn){
+  if(gbCache.has(isbn)) return Promise.resolve(gbCache.get(isbn));
+  const job=gbQueue.then(async()=>{
+    if(gbCache.has(isbn)) return gbCache.get(isbn);
+    await new Promise(r=>setTimeout(r,150));      // 立て続けに投げない
+    let url=null;
+    if(settings().rakutenId.trim()){
+      try{
+        const it=await rakutenByIsbn(isbn);
+        if(it) url=rakutenCover(it)||null;
+      }catch{}
+    }
+    if(!url){
+      try{
+        const j=await fetchJson(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&country=JP`,7000);
+        const v=j?.items?.[0]?.volumeInfo;
+        url=(v?.imageLinks?.thumbnail||v?.imageLinks?.smallThumbnail||'').replace(/^http:/,'https:')||null;
+      }catch{}
+    }
+    gbCache.set(isbn,url);
+    if(url){
+      const b=bookOf(isbn);
+      if(b){ b.coverUrl=url; scheduleSave(); }
+    }
+    return url;
+  });
+  gbQueue=job.catch(()=>{});
+  return job;
+}
+let saveTimer=null;
+function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>save(),1500); }
 
 const io = new IntersectionObserver(entries=>{
   for(const e of entries){
@@ -625,21 +681,35 @@ const io = new IntersectionObserver(entries=>{
 async function paintCover(el){
   const isbn=el.dataset.isbn;
   if(!isbn) return;
-  let url=urlCache.get(isbn);
-  if(!url){
+  let blobUrl=urlCache.get(isbn);
+  if(!blobUrl){
     try{
       const blob=await get(COVERS,isbn);
-      if(blob){ url=URL.createObjectURL(blob); urlCache.set(isbn,url); }
+      if(blob){ blobUrl=URL.createObjectURL(blob); urlCache.set(isbn,blobUrl); }
     }catch{}
   }
-  if(!url && settings().remoteCovers) url=ndlUrl(isbn);
-  if(!url) return;
+  if(blobUrl){ tryCover(el,[blobUrl],0); return; }
+  tryCover(el, coverSources(isbn, bookOf(isbn)?.coverUrl), 0);
+}
+
+/* 読み込めたものだけ差し替える。全部だめなら Google Books に聞きにいく */
+function tryCover(el,list,i){
+  if(!el.isConnected) return;
+  if(i>=list.length){
+    if(!settings().remoteCovers||el.dataset.asked) return;
+    el.dataset.asked='1';
+    const isbn=el.dataset.isbn;
+    googleCover(isbn).then(u=>{ if(u&&el.isConnected) tryCover(el,[u],0); });
+    return;
+  }
   const img=new Image();
   img.className=el.className.replace('noimg','cover');
-  img.alt=''; img.decoding='async'; img.src=url;
-  img.onerror=()=>{ img.replaceWith(el); };
-  el.replaceWith(img);
+  img.alt=''; img.decoding='async';
+  img.onload=()=>{ if(el.isConnected&&img.naturalWidth>1) el.replaceWith(img); };
+  img.onerror=()=>tryCover(el,list,i+1);
+  img.src=list[i];
 }
+
 function coverHTML(isbn,cls){
   return `<div class="noimg ${cls||''}" data-isbn="${esc(isbn||'')}">NO<br>IMAGE</div>`;
 }
@@ -659,6 +729,34 @@ async function fetchJson(url,ms=7000){
     return await r.json();
   } finally { clearTimeout(t); }
 }
+/* 楽天APIはCORSを許していないので、callbackを指定してJSONPで受け取る */
+let jsonpN=0;
+function fetchJsonp(base,params,ms=8000){
+  return new Promise((ok,ng)=>{
+    const name='__rk'+(++jsonpN)+'_'+Date.now().toString(36);
+    const sc=document.createElement('script');
+    let done=false;
+    const clean=()=>{ try{delete window[name];}catch{window[name]=undefined;} sc.remove(); };
+    const timer=setTimeout(()=>{ if(!done){done=true;clean();ng(new Error('timeout'));} },ms);
+    window[name]=data=>{ done=true; clearTimeout(timer); clean(); ok(data); };
+    const q=new URLSearchParams({...params, format:'json', callback:name});
+    sc.src=base+'?'+q.toString();
+    sc.onerror=()=>{ if(!done){done=true;clearTimeout(timer);clean();ng(new Error('jsonp'));} };
+    document.head.appendChild(sc);
+  });
+}
+const RAKUTEN_BOOKS='https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404';
+
+/* 楽天ブックスからISBNで1冊引く */
+async function rakutenByIsbn(isbn){
+  const id=settings().rakutenId.trim();
+  if(!id) return null;
+  const j=await fetchJsonp(RAKUTEN_BOOKS,{applicationId:id, isbnjan:isbn});
+  const it=j?.Items?.[0]?.Item;
+  if(!it||!it.title) return null;
+  return it;
+}
+
 function normBook(x){
   const isbn13=String(x.isbn13||'').replace(/[^\d]/g,'');
   return {
@@ -689,24 +787,27 @@ async function fromGoogle(isbn){
   const v=j?.items?.[0]?.volumeInfo;
   if(!v?.title) return null;
   const title=[v.title,v.subtitle].filter(Boolean).join(' ');
+  const thumb=(v.imageLinks?.thumbnail||v.imageLinks?.smallThumbnail||'').replace(/^http:/,'https:');
   return normBook({isbn13:isbn, title,
     author:(v.authors||[]).join('/'), publisher:v.publisher||'',
-    releasedOn:(v.publishedDate||'').replace(/-/g,'/')});
+    releasedOn:(v.publishedDate||'').replace(/-/g,'/'), coverUrl:thumb});
 }
 async function fromRakuten(isbn){
-  const id=settings().rakutenId;
-  if(!id) return null;
-  const j=await fetchJson(`https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404?format=json&applicationId=${encodeURIComponent(id)}&isbnjan=${isbn}`);
-  const it=j?.Items?.[0]?.Item;
-  if(!it?.title) return null;
+  const it=await rakutenByIsbn(isbn);
+  if(!it) return null;
   return normBook({isbn13:isbn, title:it.title, titleKana:it.titleKana||'',
     author:it.author||'', authorKana:it.authorKana||'',
     publisher:it.publisherName||'', label:it.size||'',
     releasedOn:(it.salesDate||'').replace(/年|月/g,'/').replace(/日/,''),
-    coverUrl:it.largeImageUrl||''});
+    coverUrl:rakutenCover(it)});
+}
+/* 楽天の書影URL。末尾の指定を外すと大きい画像が返る */
+function rakutenCover(it){
+  const u=it.largeImageUrl||it.mediumImageUrl||it.smallImageUrl||'';
+  return u.replace(/\?_ex=\d+x\d+$/,'?_ex=300x300');
 }
 async function lookupIsbn(isbn){
-  const sources=[fromOpenBD, fromGoogle, fromRakuten];
+  const sources=[fromRakuten, fromOpenBD, fromGoogle];
   for(const fn of sources){
     try{ const r=await fn(isbn); if(r&&r.title) return r; }catch{}
   }
@@ -796,7 +897,7 @@ function checkSeed(){
     box.innerHTML=`<div class="box" style="border-color:var(--teal)">
       <h3>引っ越し用のデータが見つかりました</h3>
       <p><b class="tnum">${d.books.length}</b>冊・<b class="tnum">${sers}</b>シリーズ。
-      これを読み込めば、ファイルを選ぶ必要はありません。表紙はISBNから自動で表示されます。</p>
+      これを読み込めば、ファイルを選ぶ必要はありません。</p>
       <button class="pick" data-act="loadSeed">この${d.books.length}冊を読み込む</button>
     </div>`;
   });
@@ -817,7 +918,7 @@ function viewWelcome(){
     </div>
     <div class="box">
       <h3>表紙の画像</h3>
-      <p>coverimages フォルダの中身を選びます。thumbnails は不要です。省いても、ISBNから国立国会図書館の書影を自動で表示します。</p>
+      <p>coverimages フォルダの中身を選びます。thumbnails は不要です。端末に保存されるので、通信が無くても表示されます。</p>
       <label class="pick ghost" for="fImg">画像を選ぶ</label>
       <input type="file" id="fImg" multiple accept="image/*">
       <div class="prog" id="imgProg"></div>
@@ -1178,7 +1279,7 @@ function viewSettings(){
     <div class="box">
       <h3>表紙</h3>
       <div class="switch"><span>ISBNから書影を取得
-        <small>手元に画像が無い本は、国立国会図書館の書影を表示します</small></span>
+        <small>手元に画像が無い本は、covers フォルダや外部の書影を探します</small></span>
         <button class="tog" data-act="tog" data-k="remoteCovers" aria-pressed="${st.remoteCovers}"></button></div>
       <div style="margin-top:12px">
         <label class="pick ghost" for="fImg2">表紙の画像を追加で取り込む</label>
@@ -1197,9 +1298,15 @@ function viewSettings(){
       <div class="switch"><span>同じ本を複数登録できる
         <small>切ると、登録済みのISBNは弾きます</small></span>
         <button class="tog" data-act="tog" data-k="allowDuplicate" aria-pressed="${st.allowDuplicate}"></button></div>
-      <div class="field" style="margin-top:12px"><label for="setRak">楽天ブックスのアプリID（任意）</label>
-        <input id="setRak" value="${esc(st.rakutenId)}" placeholder="未設定でも登録できます" autocapitalize="off" autocorrect="off"></div>
-      <button class="pick ghost" data-act="saveRak">保存する</button>
+    </div>
+
+    <div class="box" style="border-color:var(--teal)">
+      <h3>楽天ブックス（表紙と書名の取得元）</h3>
+      <p>楽天ウェブサービスの<b>アプリID</b>を入れると、表紙と書誌データをここから取得します。日本のコミックはここがいちばん揃っています。無料で、楽天の会員なら5分ほどで発行できます。</p>
+      <div class="field"><label for="setRak">アプリID（applicationId）</label>
+        <input id="setRak" value="${esc(st.rakutenId)}" placeholder="1234567890123456789" inputmode="numeric" autocapitalize="off" autocorrect="off"></div>
+      <button class="pick" data-act="saveRak">保存する</button>
+      <p class="note" style="margin-top:10px">未設定でも動きますが、表紙はあまり出ません。</p>
     </div>
 
     <div class="box">
@@ -1234,7 +1341,7 @@ function viewSettings(){
 /* ==========================================================================
    9. バーコード読み取り
    ========================================================================== */
-const scan={ open:false, reader:null, stream:null, items:[], last:'', lastAt:0 };
+const scan={ open:false, reader:null, controls:null, stream:null, items:[], last:'', lastAt:0, seen:0 };
 
 function scanUI(){
   const el=document.createElement('div');
@@ -1246,69 +1353,136 @@ function scanUI(){
       <span class="sub tnum" id="scanCount">0冊</span>
     </div>
     <div class="cam"><video id="scanVideo" playsinline muted autoplay></video><div class="reticle"></div></div>
+    <div class="status" id="scanStatus">準備しています…</div>
     <div class="list" id="scanList"><div class="empty">本の裏のバーコード（978で始まる方）を写してください。<br>続けて何冊でも読めます。</div></div>
+    <div class="manual">
+      <input id="scanIsbn" inputmode="numeric" placeholder="読めないときはISBNを手で入力" enterkeyhint="done">
+      <button class="btn ghost" data-act="scanManual">追加</button>
+    </div>
     <div class="foot">
       <button class="btn ghost" data-act="scanClose">やめる</button>
       <button class="btn" data-act="scanCommit">登録する</button>
     </div>`;
   return el;
 }
+function scanStatus(msg,bad){
+  const el=$('scanStatus');
+  if(el){ el.textContent=msg; el.className='status'+(bad?' bad':''); }
+}
 function loadScript(src){
   return new Promise((ok,ng)=>{
     const s=document.createElement('script');
-    s.src=src; s.onload=ok; s.onerror=()=>ng(new Error('load'));
+    s.src=src; s.async=true;
+    s.onload=()=>ok(src); s.onerror=()=>ng(new Error(src));
     document.head.appendChild(s);
   });
 }
+/* 読み取りライブラリを何通りか試す。置き場所や版で名前が変わるため */
+async function loadZXing(){
+  if(window.ZXingBrowser||window.ZXing) return true;
+  const urls=[
+    'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
+    'https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
+    'https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js',
+    'https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js',
+  ];
+  for(const u of urls){
+    try{
+      await loadScript(u);
+      if(window.ZXingBrowser||window.ZXing) return true;
+    }catch{}
+  }
+  return false;
+}
+function pickReader(){
+  const ns=window.ZXingBrowser||window.ZXing||{};
+  const Cls=ns.BrowserMultiFormatReader||ns.BrowserBarcodeReader;
+  return Cls?{Cls,ns}:null;
+}
 async function openScan(){
   if(scan.open) return;
-  scan.open=true; scan.items=[]; S.view='scan';
+  scan.open=true; scan.items=[]; scan.seen=0; S.view='scan';
   document.body.appendChild(scanUI());
   $('tabs').hidden=true; $('fab').hidden=true;
-  try{
-    if(!window.ZXing) await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
-  }catch{
-    scanFail('読み取り機能を読み込めませんでした。通信を確認してください。'); return;
+
+  scanStatus('読み取り機能を読み込んでいます…');
+  const loaded=await loadZXing();
+  const picked=loaded?pickReader():null;
+  if(!picked){
+    scanStatus('読み取り機能を読み込めませんでした。通信を確認するか、下の欄にISBNを手で入力してください。',true);
+    return;
   }
+
+  scanStatus('カメラを起動しています…');
   try{
-    scan.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}});
-    const v=$('scanVideo'); v.srcObject=scan.stream; await v.play().catch(()=>{});
-    const hints=new Map();
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13]);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
-    scan.reader=new ZXing.BrowserMultiFormatReader(hints,300);
-    scan.reader.decodeFromVideoElement(v,(res,err)=>{ if(res) onCode(res.getText()); });
+    scan.stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}
+    });
   }catch(e){
-    scanFail('カメラを使えませんでした。ブラウザのカメラ許可を確認してください。（httpsのページで開く必要があります）');
+    scanStatus('カメラを使えませんでした（'+(e.name||'エラー')+'）。設定でカメラの許可を確認してください。',true);
+    return;
   }
-}
-function scanFail(msg){
-  const l=$('scanList'); if(l) l.innerHTML=`<div class="empty" style="color:var(--warn)">${esc(msg)}</div>`;
+  const v=$('scanVideo');
+  if(!v){ return; }
+  v.srcObject=scan.stream;
+  try{ await v.play(); }catch{}
+
+  try{
+    const {Cls,ns}=picked;
+    let hints;
+    if(ns.DecodeHintType&&ns.BarcodeFormat){
+      hints=new Map();
+      hints.set(ns.DecodeHintType.POSSIBLE_FORMATS,[ns.BarcodeFormat.EAN_13]);
+      hints.set(ns.DecodeHintType.TRY_HARDER,true);
+    }
+    scan.reader=new Cls(hints,{delayBetweenScanAttempts:150});
+    const cb=(res,err)=>{ if(res) onCode(res.getText?res.getText():String(res)); };
+    const ret=scan.reader.decodeFromVideoElement
+      ? scan.reader.decodeFromVideoElement(v,cb)
+      : scan.reader.decodeFromVideoDevice(undefined,v,cb);
+    if(ret&&typeof ret.then==='function') ret.then(c=>{scan.controls=c;}).catch(()=>{});
+    scanStatus('バーコードを枠に写してください');
+  }catch(e){
+    scanStatus('読み取りを開始できませんでした（'+(e.message||e)+'）。ISBNの手入力は使えます。',true);
+  }
 }
 function closeScan(){
-  try{ scan.reader?.reset(); }catch{}
-  try{ scan.stream?.getTracks().forEach(t=>t.stop()); }catch{}
-  scan.reader=null; scan.stream=null; scan.open=false;
-  $('scanRoot')?.remove();
+  try{ scan.controls&&scan.controls.stop&&scan.controls.stop(); }catch{}
+  try{ scan.reader&&scan.reader.reset&&scan.reader.reset(); }catch{}
+  try{ scan.stream&&scan.stream.getTracks().forEach(t=>t.stop()); }catch{}
+  scan.reader=null; scan.controls=null; scan.stream=null; scan.open=false;
+  const r=$('scanRoot'); if(r) r.remove();
   S.view='shelf'; render();
 }
 async function onCode(code){
-  const isbn=String(code||'').replace(/[^\d]/g,'');
-  if(!/^97[89]\d{10}$/.test(isbn)) return;         // 価格用の192…バーコードは無視
+  const raw=String(code||'').replace(/[^\dX]/gi,'');
+  scan.seen++;
+  const isbn=raw.length===13?raw:(raw.length===10?'':raw);
+  if(!/^97[89]\d{10}$/.test(isbn)){
+    // 日本の本には価格用の192…バーコードも付いている。そちらは無視する
+    if(/^192/.test(raw)) scanStatus('価格のバーコードです。上側（978で始まる方）を写してください');
+    else scanStatus('読み取り：'+raw+'（本のバーコードではないようです）');
+    return;
+  }
   const now=Date.now();
   if(isbn===scan.last && now-scan.lastAt<2500) return;
   scan.last=isbn; scan.lastAt=now;
   if(scan.items.some(x=>x.isbn===isbn)) return;
 
   const item={isbn, status:'調べています…', book:null, cls:''};
-  scan.items.unshift(item); buzz(30); paintScan();
+  scan.items.unshift(item); buzz(30);
+  scanStatus('読み取りました：'+isbn);
+  paintScan();
 
   if(!settings().allowDuplicate && bookOf(isbn)){
     item.status='すでに本棚にあります'; item.cls='ng'; paintScan(); return;
   }
   const found=await lookupIsbn(isbn);
   if(found){ item.book=found; item.status='読み取りました'; item.cls='ok'; }
-  else{ item.status='書名が見つかりません（手で入力できます）'; item.cls='ng'; }
+  else{
+    item.book={...normBook({isbn13:isbn,title:'ISBN '+isbn}), needsTitle:true};
+    item.status='書名が見つかりません（あとで直せます）'; item.cls='ng';
+  }
   paintScan();
 }
 function paintScan(){
@@ -1332,7 +1506,8 @@ async function commitScan(){
   if(!ready.length){ toast('登録できる本がありません'); return; }
   let n=0;
   for(const x of ready){
-    const {coverUrl, ...book}=x.book;
+    const {coverUrl, needsTitle, ...book}=x.book;
+    if(coverUrl) book.coverUrl=coverUrl;
     const r=addBook(book);
     if(r.added){ n++; if(coverUrl) cacheRemoteCover(book.isbn13, coverUrl); }
   }
@@ -1485,6 +1660,11 @@ document.addEventListener('click', async e=>{
   if(act==='menuClose'){ $('menu')?.remove(); return; }
   if(act==='scanClose'){ closeScan(); return; }
   if(act==='scanCommit'){ commitScan(); return; }
+  if(act==='scanManual'){
+    const el=$('scanIsbn'); const v2=(el.value||'').replace(/[^\d]/g,'');
+    if(!/^97[89]\d{10}$/.test(v2)){ scanStatus('ISBNは978か979で始まる13桁です',true); return; }
+    el.value=''; scan.last=''; onCode(v2); return;
+  }
 
   if(act==='saveManual'){
     const title=$('mTitle').value.trim();
@@ -1527,7 +1707,14 @@ document.addEventListener('click', async e=>{
     await save(); render(); return;
   }
   if(act==='saveTag'){ S.lib.settings.amazonTag=$('setTag').value.trim(); await save(); toast('保存しました'); return; }
-  if(act==='saveRak'){ S.lib.settings.rakutenId=$('setRak').value.trim(); await save(); toast('保存しました'); return; }
+  if(act==='saveRak'){
+    S.lib.settings.rakutenId=$('setRak').value.trim();
+    gbCache.clear();
+    for(const b of S.lib.books) if(b.coverUrl && !/rakuten/.test(b.coverUrl)) b.coverUrl='';
+    await save(); render();
+    toast(S.lib.settings.rakutenId?'保存しました。表紙を取り直します':'保存しました');
+    return;
+  }
   if(act==='export'){ exportJson(); return; }
   if(act==='loadSeed'){
     const d=window._seed; if(!d) return;

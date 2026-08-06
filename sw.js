@@ -1,5 +1,5 @@
 /* 本棚 — オフラインでも本棚が開くようにする */
-const VERSION = 'hondana-v1';
+const VERSION = 'hondana-v2';
 const SHELL = [
   './',
   './index.html',
@@ -37,7 +37,7 @@ self.addEventListener('fetch', e => {
   if (/api\.openbd\.jp|googleapis\.com|rakuten\.co\.jp|ndlsearch\.ndl\.go\.jp/.test(url.hostname)) return;
 
   // バーコード読み取りのライブラリは一度取れたら使い回す
-  if (url.hostname === 'cdn.jsdelivr.net') {
+  if (url.hostname === 'cdn.jsdelivr.net' || url.hostname === 'unpkg.com') {
     e.respondWith(
       caches.open(VERSION).then(async c => {
         const hit = await c.match(req);
