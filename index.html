@@ -440,7 +440,7 @@ const S={
   view:'shelf', tab:'shelf',
   mode:'series', layout:'list',
   sort:'title', asc:true, filter:'all', q:'',
-  panelOpen:false, detail:null, coverCount:0,
+  panelOpen:false, detail:null, coverCount:0, shelfY:0,
 };
 const settings = () => (S.lib?.settings) || DEFAULTS;
 const maskKey = k => !k ? '' : (k.length<=6 ? '••••' : '••••'+k.slice(-4));
@@ -681,6 +681,14 @@ function askCover(isbn){
       try{
         const it=await rakutenByIsbn(isbn);
         if(it) url=rakutenCover(it)||null;
+      }catch{}
+    }
+    if(!url){
+      // openBD の書誌に書影URLが載っていることがある
+      try{
+        const j=await fetchJson(`https://api.openbd.jp/v1/get?isbn=${isbn}`,6000);
+        const c=j?.[0]?.summary?.cover;
+        if(c) url=String(c).replace(/^http:/,'https:');
       }catch{}
     }
     if(!url&&!rakutenReady()){
@@ -988,6 +996,12 @@ function render(){
   if(S.tab==='authors')   { app.innerHTML=viewAuthors();        afterRender(); return; }
   if(S.tab==='settings')  { app.innerHTML=viewSettings();       afterRender(); return; }
   app.innerHTML=viewShelf(); afterRender();
+}
+/* 描画が済んで高さが決まってから元の位置へ戻す */
+function restoreShelfScroll(){
+  const y=S.shelfY||0;
+  if(!y) return;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo(0,y)));
 }
 function afterRender(){
   hydrate();
@@ -1411,6 +1425,14 @@ function viewSettings(){
     </div>
 
     <div class="box">
+      <h3>表紙をまとめて取得</h3>
+      <p>画面に出していない本の表紙も、順に問い合わせて集めます。時間はかかりますが、放っておけば埋まります。途中でやめても、集めたぶんは残ります。</p>
+      <button class="pick ghost" data-act="bulkCovers">まとめて取得する</button>
+      <div class="prog" id="bulkProg"></div>
+      <div id="bulkResult"></div>
+    </div>
+
+    <div class="box">
       <h3>登録のしかた</h3>
       <div class="switch"><span>自動的にセットを作る
         <small>本を登録すると、書名からシリーズを作って自動でまとめます</small></span>
@@ -1755,6 +1777,32 @@ async function importJson(file){
 /* ==========================================================================
    11. 操作
    ========================================================================== */
+/* 表紙をまとめて集める */
+const bulk={running:false, stop:false};
+async function runBulkCovers(){
+  const box=$('bulkResult'), prog=$('bulkProg'), btn=document.querySelector('[data-act=bulkCovers]');
+  const todo=S.lib.books.filter(b=>!b.coverUrl && b.isbn13 && !/^x/.test(b.isbn13));
+  if(!todo.length){ if(box){box.className='result';box.textContent='すべて取得済みです';} return; }
+  bulk.running=true; bulk.stop=false;
+  if(btn) btn.textContent='とめる';
+  let done=0, found=0;
+  for(const b of todo){
+    if(bulk.stop) break;
+    const u=await askCover(b.isbn13);
+    done++; if(u) found++;
+    if(prog) prog.style.width=Math.round(done/todo.length*100)+'%';
+    if(box){ box.className='result';
+      box.innerHTML=`<b>${done}</b> / ${todo.length} 冊を確認、<b>${found}</b> 枚見つかりました`; }
+  }
+  await save();
+  bulk.running=false;
+  if(prog) prog.style.width='0';
+  if(btn) btn.textContent='まとめて取得する';
+  if(box) box.innerHTML=`終わりました。<b>${found}</b> 枚の表紙を追加しました`
+    +(bulk.stop?'（途中でとめました）':'');
+  toast(`表紙 ${found} 枚を追加しました`);
+}
+
 /* どこがつながっていて、どこが弾かれているかを調べる */
 async function runDiag(){
   const box=$('diagResult'); if(!box) return;
@@ -1867,10 +1915,13 @@ document.addEventListener('click', async e=>{
 
   if(act==='open'){
     e.preventDefault();
+    if(S.view==='shelf') S.shelfY=window.scrollY;    // 戻ったときのために覚えておく
     S.detail=id; S.view = t.dataset.kind==='series' ? 'series' : 'book';
     render(); scrollTo(0,0); return;
   }
-  if(act==='back'){ S.view='shelf'; render(); return; }
+  if(act==='back'){
+    S.view='shelf'; render(); restoreShelfScroll(); return;
+  }
   if(act==='togglePanel'){ S.panelOpen=!S.panelOpen; render(); return; }
   if(act==='toggleLayout'){ S.layout=S.layout==='grid'?'list':'grid'; render(); return; }
   if(act==='mode'){ S.mode=v; render(); return; }
@@ -1881,6 +1932,7 @@ document.addEventListener('click', async e=>{
 
   if(act==='fav'){ const s=seriesOf(id); if(s){ s.favorite=!s.favorite; await save(); render(); } return; }
   if(act==='read'){ const b=bookOf(id); if(b){ b.read=!b.read; await save(); render(); } return; }
+  if(act==='backKeep'){ S.view='shelf'; render(); restoreShelfScroll(); return; }
   if(act==='delBook'){
     if(!confirm('この本を削除します。よろしいですか？')) return;
     removeBook(id); await save(); S.view='shelf'; render(); toast('削除しました'); return;
@@ -1903,6 +1955,10 @@ document.addEventListener('click', async e=>{
     if(!confirm('保存しているアクセスキーを消します。よろしいですか？')) return;
     S.lib.settings.rakutenKey=''; rakCache.clear(); await save(); render();
     toast('消しました'); return;
+  }
+  if(act==='bulkCovers'){
+    if(bulk.running){ bulk.stop=true; return; }
+    runBulkCovers(); return;
   }
   if(act==='diag'){ runDiag(); return; }
   if(act==='rawRakuten'){
