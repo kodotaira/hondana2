@@ -93,7 +93,7 @@
   }
   .row{
     display:grid;grid-template-columns:52px 1fr auto;gap:11px;align-items:center;
-    padding:9px 40px 9px 12px;background:var(--card);border-bottom:1px solid var(--rule);
+    padding:9px 46px 9px 12px;background:var(--card);border-bottom:1px solid var(--rule);
     width:100%;text-align:left;
   }
   .row:active{background:var(--paper)}
@@ -131,9 +131,23 @@
   .tile .n{font-size:10px;color:var(--muted);font-weight:700}
 
   /* ---------- 五十音インデックス ---------- */
-  .rail{position:fixed;right:0;top:calc(var(--safe-t) + 116px);bottom:calc(var(--tab-h) + var(--safe-b) + 12px);
-    z-index:35;display:flex;flex-direction:column;justify-content:center;width:20px}
-  .rail button{font-size:9.5px;line-height:1.02;color:var(--teal);font-weight:700;width:20px;text-align:center}
+  .rail{
+    position:fixed; right:2px;
+    top:calc(var(--safe-t) + 112px); bottom:calc(var(--tab-h) + var(--safe-b) + 10px);
+    z-index:35; display:flex; flex-direction:column; justify-content:center;
+    width:36px; padding:6px 0; border-radius:18px;
+    background:color-mix(in srgb, var(--card) 82%, transparent);
+    box-shadow:0 1px 6px rgba(20,32,29,.12);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+  }
+  .rail button{
+    flex:1 1 0; min-height:0; width:36px;
+    display:grid; place-items:center;
+    font-size:15px; font-weight:800; line-height:1;
+    color:var(--teal); letter-spacing:0;
+  }
+  .rail button:active{color:#fff;background:var(--teal);border-radius:9px}
+  @media (max-height:700px){ .rail button{font-size:13px} }
 
   /* ---------- 詳細 ---------- */
   .hero{display:flex;gap:14px;padding:16px 14px;background:var(--card);border-bottom:1px solid var(--rule)}
@@ -974,6 +988,22 @@ async function fromNDL(isbn){
     publisher:pick('dc:publisher')||pick('publisher'),
     releasedOn:(pick('dcterms:issued')||pick('pubDate')||'').slice(0,10).replace(/-/g,'/')});
 }
+/* よみがなだけを取りにいく。楽天に無ければ国会図書館サーチで補う */
+async function lookupKana(isbn){
+  try{
+    if(rakutenReady()){
+      const it=await rakutenByIsbn(isbn);
+      const k=(it&&it.titleKana||'').trim();
+      if(k) return k;
+    }
+  }catch{}
+  try{
+    const r=await fromNDL(isbn);
+    if(r&&r.titleKana) return r.titleKana.trim();
+  }catch{}
+  return '';
+}
+
 async function lookupIsbn(isbn){
   const sources=[fromRakuten, fromOpenBD, fromNDL, fromGoogle];
   for(const fn of sources){
@@ -1474,6 +1504,8 @@ function viewSettings(){
       <h3>表紙をまとめて取得</h3>
       <p>画面に出していない本の表紙も、順に問い合わせて集めます。時間はかかりますが、放っておけば埋まります。途中でやめても、集めたぶんは残ります。</p>
       <button class="pick ghost" data-act="bulkCovers">まとめて取得する</button>
+      <div style="height:8px"></div>
+      <button class="pick ghost" data-act="bulkKana">よみがなをまとめて補う</button>
       <div class="prog" id="bulkProg"></div>
       <div id="bulkResult"></div>
     </div>
@@ -1849,6 +1881,32 @@ async function runBulkCovers(){
   toast(`表紙 ${found} 枚を追加しました`);
 }
 
+/* 「#」に入っているセットのよみがなをまとめて補う */
+async function runBulkKana(){
+  const box=$('bulkResult'), prog=$('bulkProg');
+  const todo=S.lib.series.filter(x=>!x.titleKana && x.isbns.length
+    && kanaHead(x.titleKana,x.title)==='#');
+  if(!todo.length){ if(box){box.className='result';box.textContent='補うものはありません';} return; }
+  bulk.running=true; bulk.stop=false;
+  let done=0, found=0;
+  for(const sr of todo){
+    if(bulk.stop) break;
+    const kana=await lookupKana(sr.isbns[0]);
+    done++;
+    if(kana){
+      sr.titleKana=kana; found++;
+      const bk=bookOf(sr.isbns[0]); if(bk&&!bk.titleKana) bk.titleKana=kana;
+    }
+    if(prog) prog.style.width=Math.round(done/todo.length*100)+'%';
+    if(box){ box.className='result';
+      box.innerHTML=`<b>${done}</b> / ${todo.length} 件を確認、<b>${found}</b> 件のよみがなを補いました`; }
+  }
+  await save(); render();
+  bulk.running=false;
+  if(prog) prog.style.width='0';
+  toast(`よみがな ${found} 件を補いました`);
+}
+
 /* どこがつながっていて、どこが弾かれているかを調べる */
 async function runDiag(){
   const box=$('diagResult'); if(!box) return;
@@ -2012,6 +2070,10 @@ document.addEventListener('click', async e=>{
     S.lib.settings.rakutenKey=''; rakCache.clear(); await save(); render();
     toast('消しました'); return;
   }
+  if(act==='bulkKana'){
+    if(bulk.running){ bulk.stop=true; return; }
+    runBulkKana(); return;
+  }
   if(act==='bulkCovers'){
     if(bulk.running){ bulk.stop=true; return; }
     runBulkCovers(); return;
@@ -2035,14 +2097,23 @@ document.addEventListener('click', async e=>{
     const f=await lookupIsbn(b.isbn13);
     if(!f){ toast('見つかりませんでした'); return; }
     b.title=f.title||b.title;
-    if(f.titleKana) b.titleKana=f.titleKana;
     b.author=f.author||b.author;
     b.publisher=f.publisher||b.publisher;
     b.label=f.label||b.label;
     b.releasedOn=f.releasedOn||b.releasedOn;
     if(f.volume!=null) b.volume=f.volume;
     if(f.coverUrl){ b.coverUrl=f.coverUrl; urlCache.delete(b.isbn13); gbCache.delete(b.isbn13); }
-    await save(); render(); toast('取り直しました'); return;
+
+    // よみがな（五十音の並びに使う）。取れたらセット側にも入れる
+    const kana=f.titleKana||await lookupKana(b.isbn13);
+    if(kana){
+      b.titleKana=kana;
+      const sr=S.lib.series.find(x=>x.isbns.includes(b.isbn13));
+      if(sr&&!sr.titleKana) sr.titleKana=kana;
+    }
+    await save(); render();
+    toast(kana?'取り直しました（よみがな：'+kana.slice(0,10)+'）':'取り直しました（よみがなは見つかりません）');
+    return;
   }
   if(act==='renameBook'){
     const b=bookOf(id); if(!b) return;
