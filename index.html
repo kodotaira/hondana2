@@ -362,6 +362,22 @@ function cleanAuthor(a){
     .filter(p=>p&&!/^(?:著|画|作|編|訳|監修)$/.test(p))
     .join('/');
 }
+/* 古い10桁のISBNを13桁に直す */
+function isbn10to13(v){
+  const t=String(v||'').toUpperCase().replace(/[^0-9X]/g,'');
+  if(t.length!==10) return '';
+  const core='978'+t.slice(0,9);
+  let sum=0;
+  for(let i=0;i<12;i++) sum+=Number(core[i])*(i%2?3:1);
+  return core+String((10-sum%10)%10);
+}
+/* ハイフンや「ISBN」の文字が混じっていても受け付ける */
+function normalizeIsbn(v){
+  const t=String(v||'').toUpperCase().replace(/[^0-9X]/g,'');
+  if(/^97[89]\d{10}$/.test(t)) return t;
+  if(/^\d{9}[\dX]$/.test(t)) return isbn10to13(t);
+  return '';
+}
 /* ISBN13 → ISBN10（＝AmazonのASIN） */
 function isbn13to10(isbn13){
   const s=String(isbn13||'').replace(/[^\dX]/gi,'');
@@ -1468,8 +1484,9 @@ function viewManual(){
       <div class="field"><label for="mAuthor">著者</label><input id="mAuthor"></div>
       <div class="field"><label for="mPub">出版社</label><input id="mPub"></div>
       <div class="field"><label for="mLabel">レーベル</label><input id="mLabel"></div>
-      <div class="field"><label for="mIsbn">ISBN13（分かれば。表紙とAmazonリンクに使います）</label>
-        <input id="mIsbn" inputmode="numeric" placeholder="9784088837857"></div>
+      <div class="field"><label for="mIsbn">ISBN（10桁・13桁どちらでも。ハイフン可）</label>
+        <input id="mIsbn" placeholder="4-575-81395-8" autocapitalize="off" spellcheck="false">
+        <button class="pill" data-act="lookupManual" style="margin-top:7px">このISBNで調べる</button></div>
       <div class="field"><label for="mDate">発売日</label><input id="mDate" placeholder="2024/01/04"></div>
       <button class="pick" data-act="saveManual">登録する</button>
       <div id="manualResult"></div>
@@ -1617,7 +1634,7 @@ function scanUI(){
     <div class="status" id="scanStatus">準備しています…</div>
     <div class="list" id="scanList"><div class="empty">本の裏のバーコード（978で始まる方）を写してください。<br>続けて何冊でも読めます。</div></div>
     <div class="manual">
-      <input id="scanIsbn" inputmode="numeric" placeholder="読めないときはISBNを手で入力" enterkeyhint="done">
+      <input id="scanIsbn" inputmode="numeric" placeholder="ISBNを手で入力（10桁でも可）" enterkeyhint="done">
       <button class="btn ghost" data-act="scanManual">追加</button>
     </div>
     <div class="foot">
@@ -2200,20 +2217,44 @@ document.addEventListener('click', async e=>{
   if(act==='scanClose'){ closeScan(); return; }
   if(act==='scanCommit'){ commitScan(); return; }
   if(act==='scanManual'){
-    const el=$('scanIsbn'); const v2=(el.value||'').replace(/[^\d]/g,'');
-    if(!/^97[89]\d{10}$/.test(v2)){ scanStatus('ISBNは978か979で始まる13桁です',true); return; }
+    const el=$('scanIsbn'); const v2=normalizeIsbn(el.value);
+    if(!v2){ scanStatus('ISBNの桁数が合いません（10桁か13桁）',true); return; }
     el.value=''; scan.last=''; onCode(v2); return;
   }
 
+  if(act==='lookupManual'){
+    const isbn=normalizeIsbn($('mIsbn').value);
+    const box=$('manualResult');
+    if(!isbn){ box.className='result bad'; box.textContent='ISBNの桁数が合いません（10桁か13桁）'; return; }
+    box.className='result'; box.textContent='調べています…';
+    const f=await lookupIsbn(isbn);
+    if(!f){ box.className='result bad'; box.innerHTML='見つかりませんでした。<br>手で入力すれば登録できます。'; return; }
+    if(!f.titleKana){ const k=await lookupKana(isbn); if(k.kana) f.titleKana=k.kana; }
+    $('mTitle').value=f.title||'';
+    $('mAuthor').value=f.author||'';
+    $('mPub').value=f.publisher||'';
+    $('mLabel').value=f.label||'';
+    $('mDate').value=f.releasedOn||'';
+    $('mIsbn').value=isbn;
+    window._manualFound=f;
+    box.className='result'; box.innerHTML=`<b>${esc(f.title)}</b><br>内容を確かめて「登録する」を押してください`;
+    return;
+  }
   if(act==='saveManual'){
     const title=$('mTitle').value.trim();
     if(!title){ toast('タイトルを入れてください'); return; }
-    const isbn=$('mIsbn').value.replace(/[^\d]/g,'');
+    const isbn=normalizeIsbn($('mIsbn').value);
+    const found=window._manualFound;
     const book={isbn13:isbn, isbn10:isbn13to10(isbn), title,
       titleKana:'', volume:volumeOf(title),
       author:$('mAuthor').value.trim(), authorKana:'',
       publisher:$('mPub').value.trim(), label:$('mLabel').value.trim(),
       releasedOn:$('mDate').value.trim(), owned:true, read:false, tags:[]};
+    if(found&&found.isbn13===isbn){
+      book.titleKana=found.titleKana||'';
+      if(found.coverUrl) book.coverUrl=found.coverUrl;
+      if(found.volume!=null&&book.volume==null) book.volume=found.volume;
+    }
     if(!book.isbn13) book.isbn13='x'+Date.now().toString(36);
     const r=addBook(book);
     const box=$('manualResult');
