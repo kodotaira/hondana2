@@ -93,7 +93,7 @@
   }
   .row{
     display:grid;grid-template-columns:52px 1fr auto;gap:11px;align-items:center;
-    padding:9px 46px 9px 12px;background:var(--card);border-bottom:1px solid var(--rule);
+    padding:9px 38px 9px 12px;background:var(--card);border-bottom:1px solid var(--rule);
     width:100%;text-align:left;
   }
   .row:active{background:var(--paper)}
@@ -133,21 +133,21 @@
   /* ---------- 五十音インデックス ---------- */
   .rail{
     position:fixed; right:2px;
-    top:calc(var(--safe-t) + 112px); bottom:calc(var(--tab-h) + var(--safe-b) + 10px);
+    top:calc(var(--safe-t) + 112px); bottom:calc(var(--tab-h) + var(--safe-b) + 86px);
     z-index:35; display:flex; flex-direction:column; justify-content:center;
-    width:36px; padding:6px 0; border-radius:18px;
+    width:27px; padding:5px 0; border-radius:14px;
     background:color-mix(in srgb, var(--card) 82%, transparent);
     box-shadow:0 1px 6px rgba(20,32,29,.12);
     -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
   }
   .rail button{
-    flex:1 1 0; min-height:0; width:36px;
+    flex:1 1 0; min-height:0; width:27px;
     display:grid; place-items:center;
-    font-size:15px; font-weight:800; line-height:1;
+    font-size:12.5px; font-weight:800; line-height:1;
     color:var(--teal); letter-spacing:0;
   }
-  .rail button:active{color:#fff;background:var(--teal);border-radius:9px}
-  @media (max-height:700px){ .rail button{font-size:13px} }
+  .rail button:active{color:#fff;background:var(--teal);border-radius:7px}
+  @media (max-height:700px){ .rail button{font-size:11px} }
 
   /* ---------- 詳細 ---------- */
   .hero{display:flex;gap:14px;padding:16px 14px;background:var(--card);border-bottom:1px solid var(--rule)}
@@ -825,10 +825,10 @@ async function fetchJson(url,ms=7000){
 /* 2026年2月に楽天のAPIが移行した。新旧どちらのIDでも動くよう順に試す。
    新方式は applicationId(UUID) と accessKey の両方が必要 */
 const RAKUTEN_APIS=[
-  {url:'https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
   {url:'https://openapi.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
-  {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'old'},
+  {url:'https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
   {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'old'},
+  {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'old'},
 ]
 const rakCache=new Map();
 let rakLastError='';
@@ -988,20 +988,39 @@ async function fromNDL(isbn){
     publisher:pick('dc:publisher')||pick('publisher'),
     releasedOn:(pick('dcterms:issued')||pick('pubDate')||'').slice(0,10).replace(/-/g,'/')});
 }
-/* よみがなだけを取りにいく。楽天に無ければ国会図書館サーチで補う */
+/* ひらがなはカタカナにそろえる */
+function toKatakana(t){
+  return String(t||'').replace(/[\u3041-\u3096]/g,c=>String.fromCharCode(c.charCodeAt(0)+0x60)).trim();
+}
+
+/* よみがなだけを取りにいく。楽天(書籍検索) → openBD の collationkey → 国会図書館 */
 async function lookupKana(isbn){
+  // 1. 楽天ブックスの書籍検索は titleKana を持っている
   try{
     if(rakutenReady()){
       const it=await rakutenByIsbn(isbn);
-      const k=(it&&it.titleKana||'').trim();
-      if(k) return k;
+      const k=toKatakana(it&&it.titleKana||'');
+      if(k) return {kana:k, from:'楽天'};
     }
   }catch{}
+  // 2. openBD の詳細データ（ONIX）に読みが入っていることがある
+  try{
+    const j=await fetchJson(`https://api.openbd.jp/v1/get?isbn=${isbn}`,7000);
+    const rec=j&&j[0];
+    let te=rec?.onix?.DescriptiveDetail?.TitleDetail?.TitleElement;
+    if(Array.isArray(te)) te=te[0];
+    const k=toKatakana(te?.TitleText?.collationkey||'');
+    if(k) return {kana:k, from:'openBD'};
+    const col=rec?.onix?.CollateralDetail?.TextContent;
+    void col;
+  }catch{}
+  // 3. 国会図書館サーチ
   try{
     const r=await fromNDL(isbn);
-    if(r&&r.titleKana) return r.titleKana.trim();
+    const k=toKatakana(r&&r.titleKana||'');
+    if(k) return {kana:k, from:'国会図書館'};
   }catch{}
-  return '';
+  return {kana:'', from:''};
 }
 
 async function lookupIsbn(isbn){
@@ -1720,7 +1739,13 @@ async function onCode(code){
     item.status='すでに本棚にあります'; item.cls='ng'; paintScan(); return;
   }
   const found=await lookupIsbn(isbn);
-  if(found){ item.book=found; item.status='読み取りました'; item.cls='ok'; }
+  if(found){
+    if(!found.titleKana){
+      const k=await lookupKana(isbn);
+      if(k.kana) found.titleKana=k.kana;
+    }
+    item.book=found; item.status='読み取りました'; item.cls='ok';
+  }
   else{
     item.book={...normBook({isbn13:isbn,title:'ISBN '+isbn}), needsTitle:true};
     item.status='書名が見つかりません（あとで直せます）'; item.cls='ng';
@@ -1891,7 +1916,7 @@ async function runBulkKana(){
   let done=0, found=0;
   for(const sr of todo){
     if(bulk.stop) break;
-    const kana=await lookupKana(sr.isbns[0]);
+    const {kana}=await lookupKana(sr.isbns[0]);
     done++;
     if(kana){
       sr.titleKana=kana; found++;
@@ -1967,6 +1992,12 @@ async function runDiag(){
   }
   if(!shown) mark('楽天の書影',false,rid?'書誌が取れないので試せません':'アプリID未設定');
   mark('openBDの書影', await tryImg(`https://cover.openbd.jp/${isbn}.jpg`));
+  put2();
+
+  try{
+    const k=await lookupKana(isbn);
+    mark('よみがな',!!k.kana,k.kana?esc(k.kana)+'（'+k.from+'）':'どこにも無い');
+  }catch{ mark('よみがな',false,'調べられません'); }
   put2();
 
   lines.push('<br>×が並ぶときは、その取得元が使えません。結果をそのまま伝えてください。');
@@ -2105,14 +2136,16 @@ document.addEventListener('click', async e=>{
     if(f.coverUrl){ b.coverUrl=f.coverUrl; urlCache.delete(b.isbn13); gbCache.delete(b.isbn13); }
 
     // よみがな（五十音の並びに使う）。取れたらセット側にも入れる
-    const kana=f.titleKana||await lookupKana(b.isbn13);
+    let kana=toKatakana(f.titleKana||''), from='';
+    if(!kana){ const r2=await lookupKana(b.isbn13); kana=r2.kana; from=r2.from; }
     if(kana){
       b.titleKana=kana;
       const sr=S.lib.series.find(x=>x.isbns.includes(b.isbn13));
       if(sr&&!sr.titleKana) sr.titleKana=kana;
     }
     await save(); render();
-    toast(kana?'取り直しました（よみがな：'+kana.slice(0,10)+'）':'取り直しました（よみがなは見つかりません）');
+    toast(kana ? `よみがな：${kana.slice(0,12)}${from?'（'+from+'）':''}`
+               : 'どこにもよみがなが無いので、手で設定してください');
     return;
   }
   if(act==='renameBook'){
