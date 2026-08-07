@@ -431,7 +431,7 @@ async function countStore(store){
    2. 状態
    ========================================================================== */
 const DEFAULTS={
-  amazonTag:'', rakutenId:'',
+  amazonTag:'', rakutenId:'', rakutenKey:'',
   remoteCovers:true, theme:'auto',
   autoSeries:true, allowDuplicate:false,
 };
@@ -773,11 +773,17 @@ function fetchJsonp(base,params,ms=8000){
     document.head.appendChild(sc);
   });
 }
-/* 書籍検索は isbn、総合検索は isbnjan と、APIごとにパラメータ名が違う */
+/* 2026年2月に楽天のAPIが移行した。新旧どちらのIDでも動くよう順に試す。
+   新方式は applicationId(UUID) と accessKey の両方が必要 */
 const RAKUTEN_APIS=[
-  {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn'},
-  {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan'},
-  {url:'https://app.rakuten.co.jp/services/api/BooksComic/Search/20170404', key:'isbn'},
+  // 新（openapi.rakuten.co.jp）
+  {url:'https://openapi.rakuten.co.jp/booksms/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
+  {url:'https://openapi.rakuten.co.jp/booksms/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
+  {url:'https://openapi.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
+  {url:'https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
+  // 旧（2026年5月に停止済みだが、念のため）
+  {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'old'},
+  {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'old'},
 ];
 const rakCache=new Map();
 let rakLastError='';
@@ -785,13 +791,17 @@ let rakLastError='';
 /* 楽天ブックスからISBNで1冊引く */
 async function rakutenByIsbn(isbn){
   const id=settings().rakutenId.trim();
+  const key=settings().rakutenKey.trim();
   if(!id) return null;
   if(rakCache.has(isbn)) return rakCache.get(isbn);
   const notes=[];
   for(const api of RAKUTEN_APIS){
-    const name=api.url.split('/api/')[1].split('/')[0];
+    const name=(api.v==='new'?'新':'旧')+api.url.split('/api/')[1].split('/')[0];
+    if(api.v==='new'&&!key) continue;          // 新方式はaccessKeyが必須
     try{
-      const j=await fetchJsonp(api.url,{applicationId:id, [api.key]:isbn});
+      const params={applicationId:id, [api.key]:isbn};
+      if(key) params.accessKey=key;
+      const j=await fetchJsonp(api.url,params);
       const it=j?.Items?.[0]?.Item || j?.Items?.[0];
       if(it&&it.title){ rakLastError=''; rakCache.set(isbn,it); return it; }
       notes.push(`${name}:0件`+(j&&j.error?`(${j.error})`:''));
@@ -1358,9 +1368,11 @@ function viewSettings(){
       <h3>楽天ブックス（表紙と書名の取得元）</h3>
       <p>楽天ウェブサービスの<b>アプリID</b>を入れると、表紙と書誌データをここから取得します。日本のコミックはここがいちばん揃っています。無料で、楽天の会員なら5分ほどで発行できます。</p>
       <div class="field"><label for="setRak">アプリID（applicationId）</label>
-        <input id="setRak" value="${esc(st.rakutenId)}" placeholder="1234567890123456789" inputmode="numeric" autocapitalize="off" autocorrect="off"></div>
+        <input id="setRak" value="${esc(st.rakutenId)}" placeholder="36桁のUUID、または19桁の数字" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="setRakKey">アクセスキー（accessKey）</label>
+        <input id="setRakKey" value="${esc(st.rakutenKey)}" placeholder="新しいアプリIDにはこちらも必須です" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
       <button class="pick" data-act="saveRak">保存する</button>
-      <p class="note" style="margin-top:10px">未設定でも動きますが、表紙はあまり出ません。</p>
+      <p class="note" style="margin-top:10px">2026年2月に楽天のAPIが新方式へ移行しました。アプリIDがUUID形式（36桁）の場合、アクセスキーの入力も必須です。</p>
     </div>
 
     <div class="box">
@@ -1694,6 +1706,8 @@ async function runDiag(){
       const it=await rakutenByIsbn(isbn);
       if(it) mark('楽天ブックス',true,esc(it.title));
       else mark('楽天ブックス',false,rakLastError||'該当なし');
+      if(!settings().rakutenKey.trim())
+        lines.push('&nbsp;&nbsp;<span style="color:var(--warn)">アクセスキーが未入力です。UUID形式のIDには必須です</span>');
     }catch(e){ mark('楽天ブックス',false,'つながりません（'+(e.message||e)+'）'); }
   }
   put2();
@@ -1814,8 +1828,11 @@ document.addEventListener('click', async e=>{
   if(act==='rawRakuten'){
     const rid=settings().rakutenId.trim();
     if(!rid){ toast('先にアプリIDを保存してください'); return; }
-    const u='https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404'
-      +'?format=json&applicationId='+encodeURIComponent(rid)+'&isbn=9784088837857';
+    const rkey=settings().rakutenKey.trim();
+    const u='https://openapi.rakuten.co.jp/booksms/api/BooksBook/Search/20170404'
+      +'?format=json&applicationId='+encodeURIComponent(rid)
+      +(rkey?'&accessKey='+encodeURIComponent(rkey):'')
+      +'&isbn=9784088837857';
     window.open(u,'_blank','noopener');
     return;
   }
@@ -1925,7 +1942,8 @@ document.addEventListener('click', async e=>{
   if(act==='saveTag'){ S.lib.settings.amazonTag=$('setTag').value.trim(); await save(); toast('保存しました'); return; }
   if(act==='saveRak'){
     S.lib.settings.rakutenId=$('setRak').value.trim();
-    gbCache.clear();
+    S.lib.settings.rakutenKey=($('setRakKey')?.value||'').trim();
+    gbCache.clear(); rakCache.clear(); rakLastError='';
     for(const b of S.lib.books) if(b.coverUrl && !/rakuten/.test(b.coverUrl)) b.coverUrl='';
     await save(); render();
     toast(S.lib.settings.rakutenId?'保存しました。表紙を取り直します':'保存しました');
