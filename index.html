@@ -142,6 +142,7 @@
   .hero .meta{font-size:12px}
   .hero .acts{margin-top:9px;display:flex;gap:6px;flex-wrap:wrap}
   .sect{padding:14px}
+  .sect:last-of-type{padding-bottom:calc(var(--tab-h) + var(--safe-b) + 30px)}
   .sect h3{margin:0 0 9px;font-size:11px;font-weight:700;letter-spacing:.13em;color:var(--muted)}
   .vgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(46px,1fr));gap:6px}
   .vcell{
@@ -657,8 +658,9 @@ function coverSources(isbn,known){
   if(known) list.push(known);
   list.push(`./covers/${isbn}_coverimage.png`);   // 手元の画像を置いた場合
   if(!settings().remoteCovers) return list;
-  list.push(`https://cover.openbd.jp/${isbn}.jpg`);
   list.push(`https://ndlsearch.ndl.go.jp/thumbnail/${isbn}.jpg`);
+  list.push(`https://iss.ndl.go.jp/thumbnail/${isbn}`);
+  list.push(`https://cover.openbd.jp/${isbn}.jpg`);
   return list;
 }
 
@@ -778,19 +780,26 @@ const RAKUTEN_APIS=[
   {url:'https://app.rakuten.co.jp/services/api/BooksComic/Search/20170404', key:'isbn'},
 ];
 const rakCache=new Map();
+let rakLastError='';
 
 /* 楽天ブックスからISBNで1冊引く */
 async function rakutenByIsbn(isbn){
   const id=settings().rakutenId.trim();
   if(!id) return null;
   if(rakCache.has(isbn)) return rakCache.get(isbn);
+  const notes=[];
   for(const api of RAKUTEN_APIS){
+    const name=api.url.split('/api/')[1].split('/')[0];
     try{
       const j=await fetchJsonp(api.url,{applicationId:id, [api.key]:isbn});
       const it=j?.Items?.[0]?.Item || j?.Items?.[0];
-      if(it&&it.title){ rakCache.set(isbn,it); return it; }
-    }catch{}
+      if(it&&it.title){ rakLastError=''; rakCache.set(isbn,it); return it; }
+      notes.push(`${name}:0件`+(j&&j.error?`(${j.error})`:''));
+    }catch(e){
+      notes.push(`${name}:${e.message==='timeout'?'応答なし':'拒否された'}`);
+    }
   }
+  rakLastError=notes.join(' / ');
   rakCache.set(isbn,null);
   return null;
 }
@@ -1369,6 +1378,9 @@ function viewSettings(){
       <p>表紙や書名の取得元に、この端末からつながるか調べます。</p>
       <button class="pick ghost" data-act="diag">接続テストをする</button>
       <div id="diagResult"></div>
+      <div style="height:10px"></div>
+      <button class="pick ghost" data-act="rawRakuten">楽天の応答を直接ひらく</button>
+      <p class="note" style="margin-top:8px">新しいタブで楽天APIの生の返事を表示します。エラー文が出ていれば、それが原因です。</p>
     </div>
 
     <div class="box">
@@ -1681,7 +1693,7 @@ async function runDiag(){
     try{
       const it=await rakutenByIsbn(isbn);
       if(it) mark('楽天ブックス',true,esc(it.title));
-      else mark('楽天ブックス',false,'応答はあったが該当なし（IDか許可ドメインの設定を確認）');
+      else mark('楽天ブックス',false,rakLastError||'該当なし');
     }catch(e){ mark('楽天ブックス',false,'つながりません（'+(e.message||e)+'）'); }
   }
   put2();
@@ -1799,6 +1811,14 @@ document.addEventListener('click', async e=>{
   }
 
   if(act==='diag'){ runDiag(); return; }
+  if(act==='rawRakuten'){
+    const rid=settings().rakutenId.trim();
+    if(!rid){ toast('先にアプリIDを保存してください'); return; }
+    const u='https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404'
+      +'?format=json&applicationId='+encodeURIComponent(rid)+'&isbn=9784088837857';
+    window.open(u,'_blank','noopener');
+    return;
+  }
   if(act==='refetch'){
     const b=bookOf(id); if(!b) return;
     toast('取り直しています…');
