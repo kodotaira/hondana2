@@ -758,22 +758,6 @@ async function fetchJson(url,ms=7000){
     return await r.json();
   } finally { clearTimeout(t); }
 }
-/* 楽天APIはCORSを許していないので、callbackを指定してJSONPで受け取る */
-let jsonpN=0;
-function fetchJsonp(base,params,ms=8000){
-  return new Promise((ok,ng)=>{
-    const name='__rk'+(++jsonpN)+'_'+Date.now().toString(36);
-    const sc=document.createElement('script');
-    let done=false;
-    const clean=()=>{ try{delete window[name];}catch{window[name]=undefined;} sc.remove(); };
-    const timer=setTimeout(()=>{ if(!done){done=true;clean();ng(new Error('timeout'));} },ms);
-    window[name]=data=>{ done=true; clearTimeout(timer); clean(); ok(data); };
-    const q=new URLSearchParams({...params, format:'json', callback:name, callBack:name});
-    sc.src=base+'?'+q.toString();
-    sc.onerror=()=>{ if(!done){done=true;clearTimeout(timer);clean();ng(new Error('jsonp'));} };
-    document.head.appendChild(sc);
-  });
-}
 /* 2026年2月に楽天のAPIが移行した。新旧どちらのIDでも動くよう順に試す。
    新方式は applicationId(UUID) と accessKey の両方が必要 */
 const RAKUTEN_APIS=[
@@ -785,26 +769,76 @@ const RAKUTEN_APIS=[
 const rakCache=new Map();
 let rakLastError='';
 
+/* 楽天のエラー応答から読める文言を取り出す */
+function rakErr(j){
+  if(!j) return '';
+  if(j.error) return j.error+(j.error_description?'（'+j.error_description+'）':'');
+  const e=j.errors&&j.errors[0];
+  if(e) return (e.errorCode||'')+' '+(e.errorMessage||'');
+  if(j.statusCode) return j.statusCode+' '+(j.message||'');
+  return '';
+}
+
+/* まず通常の通信で試す。新APIはブラウザからの利用を想定しているのでこちらが本命 */
+async function rakFetch(url,params,ms=8000){
+  const ac=new AbortController();
+  const timer=setTimeout(()=>ac.abort(),ms);
+  try{
+    const q=new URLSearchParams({...params, format:'json'});
+    const r=await fetch(url+'?'+q.toString(),{signal:ac.signal});
+    const text=await r.text();
+    let j=null; try{ j=JSON.parse(text); }catch{}
+    if(!r.ok){
+      const e=new Error(rakErr(j)||('HTTP '+r.status));
+      e.readable=true; throw e;
+    }
+    return j;
+  } finally { clearTimeout(timer); }
+}
+
+/* 通信が遮られたときの逃げ道 */
+let jsonpN=0;
+function fetchJsonp(base,params,ms=8000){
+  return new Promise((ok,ng)=>{
+    const name='__rk'+(++jsonpN)+'_'+Date.now().toString(36);
+    const sc=document.createElement('script');
+    let done=false;
+    const clean=()=>{ try{delete window[name];}catch{window[name]=undefined;} sc.remove(); };
+    const timer=setTimeout(()=>{ if(!done){done=true;clean();ng(new Error('timeout'));} },ms);
+    window[name]=data=>{ done=true; clearTimeout(timer); clean(); ok(data); };
+    const q=new URLSearchParams({...params, format:'json', callback:name});
+    sc.src=base+'?'+q.toString();
+    sc.onerror=()=>{ if(!done){done=true;clearTimeout(timer);clean();ng(new Error('jsonp'));} };
+    document.head.appendChild(sc);
+  });
+}
+
+
+
 /* 楽天ブックスからISBNで1冊引く */
 async function rakutenByIsbn(isbn){
   const id=settings().rakutenId.trim();
   const key=settings().rakutenKey.trim();
   if(!id) return null;
   if(rakCache.has(isbn)) return rakCache.get(isbn);
+
   const notes=[];
   for(const api of RAKUTEN_APIS){
     const name=(api.v==='new'?'新':'旧')+api.url.split('/api/')[1].split('/')[0];
-    if(api.v==='new'&&!key) continue;          // 新方式はaccessKeyが必須
-    try{
-      const params={applicationId:id, [api.key]:isbn};
-      if(key) params.accessKey=key;
-      const j=await fetchJsonp(api.url,params);
-      const it=j?.Items?.[0]?.Item || j?.Items?.[0];
-      if(it&&it.title){ rakLastError=''; rakCache.set(isbn,it); return it; }
-      notes.push(`${name}:0件`+(j&&j.error?`(${j.error})`:''));
-    }catch(e){
-      notes.push(`${name}:${e.message==='timeout'?'応答なし':'拒否された'}`);
+    if(api.v==='new'&&!key) continue;
+    const params={applicationId:id, [api.key]:isbn};
+    if(key) params.accessKey=key;
+
+    let j=null, how='';
+    try{ j=await rakFetch(api.url,params); how='通信'; }
+    catch(e){
+      if(e.readable){ notes.push(`${name}:${e.message}`); continue; }   // 応答は読めた＝内容が答え
+      try{ j=await fetchJsonp(api.url,params); how='JSONP'; }
+      catch(e2){ notes.push(`${name}:${e2.message==='timeout'?'応答なし':'遮断された'}`); continue; }
     }
+    const it=j?.Items?.[0]?.Item || j?.Items?.[0];
+    if(it&&it.title){ rakLastError=''; rakCache.set(isbn,it); return it; }
+    notes.push(`${name}:0件${rakErr(j)?'('+rakErr(j)+')':''}`);
   }
   rakLastError=notes.join(' / ');
   rakCache.set(isbn,null);
@@ -1397,7 +1431,7 @@ function viewSettings(){
       <div id="diagResult"></div>
       <div style="height:10px"></div>
       <button class="pick ghost" data-act="rawRakuten">楽天の応答を直接ひらく</button>
-      <p class="note" style="margin-top:8px">新しいタブで楽天APIの生の返事を表示します。エラー文が出ていれば、それが原因です。</p>
+      <p class="note" style="margin-top:8px">新しいタブで楽天APIの生の返事を表示します。ただし直接ひらくと参照元が送られないため、<b>403 REFERRER_MISSING は正常な反応</b>です。原因の切り分けは上の接続テストを見てください。</p>
     </div>
 
     <div class="box">
