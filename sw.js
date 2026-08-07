@@ -1,5 +1,5 @@
 /* 本棚 — オフラインでも本棚が開くようにする */
-const VERSION = 'hondana-v2';
+const VERSION = 'hondana-v3';
 const SHELL = [
   './',
   './index.html',
@@ -61,7 +61,11 @@ self.addEventListener('fetch', e => {
           }
           return res;
         })
-        .catch(() => caches.match(req).then(hit => hit || caches.match('./index.html')))
+        .catch(() =>
+          caches.match(req)
+            .then(hit => hit || caches.match('./index.html'))
+            .then(hit => hit || new Response('', { status: 504, statusText: 'offline' }))
+        )
     );
   }
 });

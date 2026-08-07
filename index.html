@@ -653,33 +653,37 @@ const urlCache=new Map();
 const gbCache=new Map();          // ISBN → 書影URL（見つからなければ null）
 let gbQueue=Promise.resolve();    // 問い合わせは1件ずつ
 
-/* すぐ試せる候補。ここで見つからなければ Google Books に問い合わせる */
-function coverSources(isbn,known){
+let hasLocalCovers=null;      // covers/ フォルダがあるかは一度だけ確かめる
+
+/* 楽天が使えるなら、当て推量のURLは踏まずに直接そこへ聞く */
+function rakutenReady(){
+  const st=settings();
+  return !!(st.rakutenId.trim() && st.rakutenKey.trim());
+}
+function guessSources(isbn){
   const list=[];
-  if(known) list.push(known);
-  list.push(`./covers/${isbn}_coverimage.png`);   // 手元の画像を置いた場合
+  if(hasLocalCovers!==false) list.push(`./covers/${isbn}_coverimage.png`);
   if(!settings().remoteCovers) return list;
   list.push(`https://ndlsearch.ndl.go.jp/thumbnail/${isbn}.jpg`);
-  list.push(`https://iss.ndl.go.jp/thumbnail/${isbn}`);
   list.push(`https://cover.openbd.jp/${isbn}.jpg`);
   return list;
 }
 
 /* 書影URLを問い合わせる。楽天を優先し、無ければGoogle Books。
    結果は本の情報に覚えさせるので、二度目以降は通信しない */
-function googleCover(isbn){
+function askCover(isbn){
   if(gbCache.has(isbn)) return Promise.resolve(gbCache.get(isbn));
   const job=gbQueue.then(async()=>{
     if(gbCache.has(isbn)) return gbCache.get(isbn);
-    await new Promise(r=>setTimeout(r,150));      // 立て続けに投げない
+    await new Promise(r=>setTimeout(r,300));      // 立て続けに投げない
     let url=null;
-    if(settings().rakutenId.trim()){
+    if(rakutenReady()){
       try{
         const it=await rakutenByIsbn(isbn);
         if(it) url=rakutenCover(it)||null;
       }catch{}
     }
-    if(!url){
+    if(!url&&!rakutenReady()){
       try{
         const j=await fetchJson(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&country=JP`,7000);
         const v=j?.items?.[0]?.volumeInfo;
@@ -710,6 +714,8 @@ const io = new IntersectionObserver(entries=>{
 async function paintCover(el){
   const isbn=el.dataset.isbn;
   if(!isbn) return;
+
+  // ① 端末に取り込んだ画像
   let blobUrl=urlCache.get(isbn);
   if(!blobUrl){
     try{
@@ -718,25 +724,44 @@ async function paintCover(el){
     }catch{}
   }
   if(blobUrl){ tryCover(el,[blobUrl],0); return; }
-  tryCover(el, coverSources(isbn, bookOf(isbn)?.coverUrl), 0);
+
+  // ② 前に見つけたURL
+  const known=bookOf(isbn)?.coverUrl;
+  if(known){ tryCover(el,[known],0); return; }
+
+  // ③ 楽天が使えるなら直接そこへ。使えないときだけ当て推量のURLを試す
+  if(rakutenReady()){
+    el.dataset.asked='1';
+    const u=await askCover(isbn);
+    if(u&&el.isConnected) tryCover(el,[u],0);
+    else if(el.isConnected) tryCover(el,guessSources(isbn),0);
+    return;
+  }
+  tryCover(el,guessSources(isbn),0);
 }
 
-/* 読み込めたものだけ差し替える。全部だめなら Google Books に聞きにいく */
+/* 読み込めたものだけ差し替える。全部だめなら問い合わせにいく */
 function tryCover(el,list,i){
   if(!el.isConnected) return;
   if(i>=list.length){
     if(!settings().remoteCovers||el.dataset.asked) return;
     el.dataset.asked='1';
-    const isbn=el.dataset.isbn;
-    googleCover(isbn).then(u=>{ if(u&&el.isConnected) tryCover(el,[u],0); });
+    askCover(el.dataset.isbn).then(u=>{ if(u&&el.isConnected) tryCover(el,[u],0); });
     return;
   }
+  const src=list[i];
   const img=new Image();
   img.className=el.className.replace('noimg','cover');
   img.alt=''; img.decoding='async';
-  img.onload=()=>{ if(el.isConnected&&img.naturalWidth>1) el.replaceWith(img); };
-  img.onerror=()=>tryCover(el,list,i+1);
-  img.src=list[i];
+  img.onload=()=>{
+    if(src.startsWith('./covers/')) hasLocalCovers=true;
+    if(el.isConnected&&img.naturalWidth>1) el.replaceWith(img);
+  };
+  img.onerror=()=>{
+    if(src.startsWith('./covers/')) hasLocalCovers=false;   // 無いと分かれば以後は試さない
+    tryCover(el,list,i+1);
+  };
+  img.src=src;
 }
 
 function coverHTML(isbn,cls){
