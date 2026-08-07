@@ -443,6 +443,7 @@ const S={
   panelOpen:false, detail:null, coverCount:0,
 };
 const settings = () => (S.lib?.settings) || DEFAULTS;
+const maskKey = k => !k ? '' : (k.length<=6 ? '••••' : '••••'+k.slice(-4));
 const save = () => put(KV,'library',S.lib);
 
 function emptyLib(){
@@ -776,15 +777,11 @@ function fetchJsonp(base,params,ms=8000){
 /* 2026年2月に楽天のAPIが移行した。新旧どちらのIDでも動くよう順に試す。
    新方式は applicationId(UUID) と accessKey の両方が必要 */
 const RAKUTEN_APIS=[
-  // 新（openapi.rakuten.co.jp）
-  {url:'https://openapi.rakuten.co.jp/booksms/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
-  {url:'https://openapi.rakuten.co.jp/booksms/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
-  {url:'https://openapi.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
   {url:'https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'new'},
-  // 旧（2026年5月に停止済みだが、念のため）
-  {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'old'},
+  {url:'https://openapi.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'new'},
   {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan', v:'old'},
-];
+  {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn',    v:'old'},
+]
 const rakCache=new Map();
 let rakLastError='';
 
@@ -1369,10 +1366,18 @@ function viewSettings(){
       <p>楽天ウェブサービスの<b>アプリID</b>を入れると、表紙と書誌データをここから取得します。日本のコミックはここがいちばん揃っています。無料で、楽天の会員なら5分ほどで発行できます。</p>
       <div class="field"><label for="setRak">アプリID（applicationId）</label>
         <input id="setRak" value="${esc(st.rakutenId)}" placeholder="36桁のUUID、または19桁の数字" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="setRakKey">アクセスキー（accessKey）</label>
-        <input id="setRakKey" value="${esc(st.rakutenKey)}" placeholder="新しいアプリIDにはこちらも必須です" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field">
+        <label for="setRakKey">アクセスキー（accessKey）
+          ${st.rakutenKey?`<span style="color:var(--teal)">保存済み ${esc(maskKey(st.rakutenKey))}</span>`:''}</label>
+        <input id="setRakKey" type="password" value="" placeholder="${st.rakutenKey?'変更するときだけ入力':'新しいアプリIDにはこちらも必須です'}"
+          autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
+        <button class="pill" data-act="peekKey" aria-pressed="false" style="margin-top:6px">入力中の文字を表示</button>
+      </div>
       <button class="pick" data-act="saveRak">保存する</button>
+      ${st.rakutenKey?`<div style="height:8px"></div>
+      <button class="btn danger wide" data-act="clearKey">アクセスキーを消す</button>`:''}
       <p class="note" style="margin-top:10px">2026年2月に楽天のAPIが新方式へ移行しました。アプリIDがUUID形式（36桁）の場合、アクセスキーの入力も必須です。</p>
+      <p class="note">キーはこの端末の中だけに保存され、書き出しファイルには含まれません。万一漏れても楽天の管理画面で再発行すれば無効になります。</p>
     </div>
 
     <div class="box">
@@ -1664,7 +1669,9 @@ async function importImageFiles(files){
 }
 function exportJson(){
   if(!S.lib) return;
-  const data={...S.lib, savedAt:new Date().toISOString()};
+  // アクセスキーなどの秘密の値は書き出しに含めない
+  const {rakutenKey, ...safeSettings}=S.lib.settings||{};
+  const data={...S.lib, settings:safeSettings, savedAt:new Date().toISOString()};
   const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
@@ -1678,7 +1685,8 @@ async function importJson(file){
   try{
     const data=JSON.parse(await readText(file));
     if(!Array.isArray(data.books)) throw new Error('本棚のファイルではないようです');
-    S.lib={...emptyLib(), ...data, settings:{...DEFAULTS,...(data.settings||{})}};
+    const keep=S.lib?.settings?.rakutenKey||'';
+    S.lib={...emptyLib(), ...data, settings:{...DEFAULTS,...(data.settings||{}), rakutenKey:keep}};
     await save();
     toast(`${S.lib.books.length}冊を読み込みました`);
     S.view='shelf'; S.tab='shelf'; render();
@@ -1824,15 +1832,29 @@ document.addEventListener('click', async e=>{
     removeSeries(id); await save(); S.view='shelf'; render(); toast('削除しました'); return;
   }
 
+  if(act==='peekKey'){
+    const el=$('setRakKey'); if(!el) return;
+    const show=el.type==='password';
+    el.type=show?'text':'password';
+    t.setAttribute('aria-pressed',String(show));
+    t.textContent=show?'文字を隠す':'入力中の文字を表示';
+    return;
+  }
+  if(act==='clearKey'){
+    if(!confirm('保存しているアクセスキーを消します。よろしいですか？')) return;
+    S.lib.settings.rakutenKey=''; rakCache.clear(); await save(); render();
+    toast('消しました'); return;
+  }
   if(act==='diag'){ runDiag(); return; }
   if(act==='rawRakuten'){
     const rid=settings().rakutenId.trim();
     if(!rid){ toast('先にアプリIDを保存してください'); return; }
+    if(!confirm('新しいタブのアドレス欄にアクセスキーがそのまま表示されます。\n人に見せる画面では実行しないでください。\n\n続けますか？')) return;
     const rkey=settings().rakutenKey.trim();
-    const u='https://openapi.rakuten.co.jp/booksms/api/BooksBook/Search/20170404'
+    const u='https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404'
       +'?format=json&applicationId='+encodeURIComponent(rid)
       +(rkey?'&accessKey='+encodeURIComponent(rkey):'')
-      +'&isbn=9784088837857';
+      +'&isbnjan=9784088837857';
     window.open(u,'_blank','noopener');
     return;
   }
@@ -1942,7 +1964,8 @@ document.addEventListener('click', async e=>{
   if(act==='saveTag'){ S.lib.settings.amazonTag=$('setTag').value.trim(); await save(); toast('保存しました'); return; }
   if(act==='saveRak'){
     S.lib.settings.rakutenId=$('setRak').value.trim();
-    S.lib.settings.rakutenKey=($('setRakKey')?.value||'').trim();
+    const nk=($('setRakKey')?.value||'').trim();
+    if(nk) S.lib.settings.rakutenKey=nk;      // 空欄なら今のキーを残す
     gbCache.clear(); rakCache.clear(); rakLastError='';
     for(const b of S.lib.books) if(b.coverUrl && !/rakuten/.test(b.coverUrl)) b.coverUrl='';
     await save(); render();
