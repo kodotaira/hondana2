@@ -105,14 +105,15 @@
     width:52px;height:74px;border-radius:2px;background:var(--rule);display:grid;place-items:center;
     font-size:8.5px;color:var(--dim);letter-spacing:.04em;text-align:center;padding:3px;
   }
-  .title{font-size:14.5px;font-weight:600;line-height:1.32;overflow-wrap:anywhere}
-  .meta{margin-top:3px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
-  .vol{font-size:19px;font-weight:700;color:var(--teal);letter-spacing:-.02em;text-align:center}
+  .title{display:block;font-size:14.5px;font-weight:600;line-height:1.32;overflow-wrap:anywhere}
+  .meta{display:block;margin-top:3px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+  .row>span{display:block;min-width:0}
+  .vol{display:block;font-size:19px;font-weight:700;color:var(--teal);letter-spacing:-.02em;text-align:center}
   .vol small{display:block;font-size:8.5px;font-weight:700;color:var(--muted);letter-spacing:.08em}
   .flags{display:flex;gap:3px;justify-content:flex-end;margin-top:3px;font-size:11px}
   .flag{color:var(--dim)}
   .flag.on{color:var(--teal)}
-  .gapnote{font-size:11px;color:var(--warn);font-weight:700;margin-top:3px}
+  .gapnote{display:block;font-size:11px;color:var(--warn);font-weight:700;margin-top:3px}
 
   /* 署名要素：背表紙ストリップ（欠けが歯抜けで見える） */
   .spines{grid-column:2 / -1;display:flex;gap:2px;margin-top:6px;align-items:flex-end;height:12px}
@@ -315,28 +316,35 @@ function normKey(s){
     .toLowerCase();
 }
 /* タイトルから巻数を落としてシリーズ名にする */
-const VOL_TAIL = /[\s　]*(?:[（(【\[]\s*\d{1,4}\s*[)）】\]]|第?\s*\d{1,4}\s*巻|\d{1,4})\s*$/;
+const VOL_UNIT = '(?:日目|巻|話|冊|部|集|号|章|夜|幕)';
+const VOL_TAIL = new RegExp(
+  '[\\s　]*[.．・:：]?[\\s　]*' +
+  '(?:[（(【\\[]\\s*\\d{1,4}\\s*[)）】\\]]|第?\\s*\\d{1,4}\\s*' + VOL_UNIT + '|\\d{1,4})\\s*$'
+);
 function seriesTitleOf(title){
   const t=String(title||'').trim();
-  const s=t.replace(VOL_TAIL,'').trim();
+  const s=t.replace(VOL_TAIL,'').replace(/[\s　.．・:：]+$/,'').trim();
   return s.length>=1 ? s : t;
 }
-/* シリーズ名を取り除いてから巻数を探す（例：「ゴルゴ13 182 甦る潜像」→182） */
-function volumeFromTitle(title, seriesTitle){
-  const tail=volumeOf(title);
-  if(tail!=null&&tail!==0) return tail;
-  let t=String(title||'').trim();
-  const st=String(seriesTitle||'').trim();
-  if(st&&t.startsWith(st)) t=t.slice(st.length);
-  else if(st&&normKey(t).startsWith(normKey(st))) t=t.replace(/^\S+/,'');
-  const m=t.match(/(\d{1,4})/);
-  const n=m?toInt(m[1]):null;
-  return n===0?null:n;
-}
 function volumeOf(title){
-  const m=String(title||'').match(/(?:[（(【\[]\s*(\d{1,4})\s*[)）】\]]|第?\s*(\d{1,4})\s*巻|[\s　](\d{1,4}))\s*$/);
+  const m=String(title||'').match(new RegExp(
+    '(?:[（(【\\[]\\s*(\\d{1,4})\\s*[)）】\\]]|第?\\s*(\\d{1,4})\\s*' + VOL_UNIT + '|[\\s　.．・:：](\\d{1,4}))\\s*$'
+  ));
   if(!m) return null;
   return toInt(m[1]??m[2]??m[3]);
+}
+/* 「小山,健,1984-」「島本和彦/著」のような表記を整える。共著はスラッシュで残す */
+const ROLE=/[\s　]*(?:著|画|作|作画|原作|漫画|編|編集|訳|翻訳|監修|原案|イラスト)+[\s　]*$/;
+function cleanAuthor(a){
+  return String(a||'')
+    .split(/[／\/]/)
+    .map(p=>p
+      .replace(/,\s*\d{4}\s*-?\s*\d{0,4}/g,'')     // 生年の付記を落とす
+      .replace(ROLE,'')
+      .split(/[,、]/).map(x=>x.trim()).filter(Boolean).join(''))
+    .map(p=>p.trim())
+    .filter(p=>p&&!/^(?:著|画|作|編|訳|監修)$/.test(p))
+    .join('/');
 }
 /* ISBN13 → ISBN10（＝AmazonのASIN） */
 function isbn13to10(isbn13){
@@ -612,6 +620,24 @@ function removeBook(isbn){
   S.lib.series=S.lib.series.filter(s=>s.isbns.length>0);
   del(COVERS,isbn);
 }
+/* ほかのセットに吸収させる */
+function mergeSeries(fromId,toId){
+  const a=seriesOf(fromId), b=seriesOf(toId);
+  if(!a||!b||a===b) return;
+  for(const isbn of a.isbns) if(!b.isbns.includes(isbn)) b.isbns.push(isbn);
+  b.standalone=false;
+  if(!b.titleKana&&a.titleKana) b.titleKana=a.titleKana;
+  S.lib.series=S.lib.series.filter(x=>x.id!==fromId);
+  // 巻数が空の本は、新しいセット名を手がかりに拾い直す
+  for(const isbn of b.isbns){
+    const bk=bookOf(isbn);
+    if(bk&&bk.volume==null){
+      const v=volumeFromTitle(bk.title,b.title);
+      if(v!=null) bk.volume=v;
+    }
+  }
+  sortSeriesBooks(b);
+}
 function removeSeries(id){
   const s=seriesOf(id); if(!s) return;
   for(const i of s.isbns){ S.lib.books=S.lib.books.filter(b=>b.isbn13!==i); del(COVERS,i); }
@@ -739,7 +765,7 @@ function fetchJsonp(base,params,ms=8000){
     const clean=()=>{ try{delete window[name];}catch{window[name]=undefined;} sc.remove(); };
     const timer=setTimeout(()=>{ if(!done){done=true;clean();ng(new Error('timeout'));} },ms);
     window[name]=data=>{ done=true; clearTimeout(timer); clean(); ok(data); };
-    const q=new URLSearchParams({...params, format:'json', callback:name});
+    const q=new URLSearchParams({...params, format:'json', callback:name, callBack:name});
     sc.src=base+'?'+q.toString();
     sc.onerror=()=>{ if(!done){done=true;clearTimeout(timer);clean();ng(new Error('jsonp'));} };
     document.head.appendChild(sc);
@@ -763,7 +789,7 @@ function normBook(x){
     isbn13, isbn10:x.isbn10||isbn13to10(isbn13),
     title:x.title||'', titleKana:x.titleKana||'', subtitle:'',
     volume: x.volume!=null?toInt(x.volume):volumeOf(x.title),
-    author:x.author||'', authorKana:x.authorKana||'',
+    author:cleanAuthor(x.author||''), authorKana:x.authorKana||'',
     publisher:x.publisher||'', label:x.label||'',
     releasedOn:x.releasedOn||'', addedOn:'',
     owned:true, read:false, wanted:false, ordered:false, rating:0,
@@ -1144,7 +1170,9 @@ function viewSeries(id){
   </div>`:''}
   <main>${rows.join('')}</main>
   ${affNote()?`<div class="sect" style="padding-top:0">${affNote()}</div>`:''}
-  <div class="sect">
+  <div class="sect" style="display:grid;gap:8px">
+    <button class="btn ghost wide" data-act="renameSeries" data-id="${esc(s.id)}">セット名を変更</button>
+    <button class="btn ghost wide" data-act="mergeSeries" data-id="${esc(s.id)}">ほかのセットにまとめる</button>
     <button class="btn danger wide" data-act="delSeries" data-id="${esc(s.id)}">このシリーズを削除</button>
   </div>`;
 }
@@ -1320,6 +1348,13 @@ function viewSettings(){
     </div>
 
     <div class="box">
+      <h3>うまく動かないとき</h3>
+      <p>表紙や書名の取得元に、この端末からつながるか調べます。</p>
+      <button class="pick ghost" data-act="diag">接続テストをする</button>
+      <div id="diagResult"></div>
+    </div>
+
+    <div class="box">
       <h3>データ</h3>
       <p>蔵書 <b class="tnum">${total}</b> 冊。書き出したファイルがあれば、この本棚が無くなってもデータは残ります。</p>
       <button class="pick" data-act="export">書き出す（JSON）</button>
@@ -1330,6 +1365,8 @@ function viewSettings(){
       <label class="pick ghost" for="fCsv2">set本管理のCSVを取り込む</label>
       <input type="file" id="fCsv2" multiple accept=".csv,text/csv,text/plain">
       <div id="csvResult"></div>
+      <div style="height:8px"></div>
+      <button class="pick ghost" data-act="tidyAuthors">著者名の表記を整える</button>
       <div style="height:14px"></div>
       <button class="btn danger wide" data-act="wipe">すべて削除する</button>
     </div>
@@ -1610,6 +1647,96 @@ async function importJson(file){
 /* ==========================================================================
    11. 操作
    ========================================================================== */
+/* どこがつながっていて、どこが弾かれているかを調べる */
+async function runDiag(){
+  const box=$('diagResult'); if(!box) return;
+  const isbn='9784088837857';                     // ONE PIECE 107巻
+  const lines=[]; const put2=()=>{ box.className='result'; box.innerHTML=lines.join('<br>'); };
+  lines.push('調べています…'); put2();
+
+  const mark=(name,ok,extra)=>lines.push(`${ok?'○':'×'} ${name}${extra?' … '+extra:''}`);
+  lines.length=0;
+
+  // 楽天
+  const rid=settings().rakutenId.trim();
+  if(!rid){ mark('楽天ブックス',false,'アプリID未設定'); }
+  else{
+    try{
+      const it=await rakutenByIsbn(isbn);
+      if(it) mark('楽天ブックス',true,esc(it.title));
+      else mark('楽天ブックス',false,'応答はあったが該当なし');
+    }catch(e){ mark('楽天ブックス',false,'つながりません（'+(e.message||e)+'）'); }
+  }
+  put2();
+
+  // openBD
+  try{ const r=await fromOpenBD(isbn); mark('openBD',!!r,r?esc(r.title):'該当なし'); }
+  catch(e){ mark('openBD',false,'つながりません'); }
+  put2();
+
+  // Google Books
+  try{ const r=await fromGoogle(isbn); mark('Google Books',!!r,r?esc(r.title):'該当なし'); }
+  catch(e){ mark('Google Books',false,'つながりません'); }
+  put2();
+
+  // 書影が実際に画像として読めるか
+  const tryImg=u=>new Promise(ok=>{
+    const i=new Image(); let done=false;
+    const fin=v=>{ if(!done){done=true;ok(v);} };
+    i.onload=()=>fin(i.naturalWidth>1); i.onerror=()=>fin(false);
+    setTimeout(()=>fin(false),6000); i.src=u;
+  });
+  let shown=false;
+  if(rid){
+    try{
+      const it=await rakutenByIsbn(isbn);
+      if(it){ const u=rakutenCover(it); mark('楽天の書影',await tryImg(u)); shown=true; }
+    }catch{}
+  }
+  if(!shown) mark('楽天の書影',false,'IDが無いので試せません');
+  mark('openBDの書影', await tryImg(`https://cover.openbd.jp/${isbn}.jpg`));
+  put2();
+
+  lines.push('<br>×が並ぶときは、その取得元が使えません。結果をそのまま伝えてください。');
+  put2();
+}
+
+function openMerge(id){
+  const cur=seriesOf(id); if(!cur) return;
+  const rows=S.lib.series.filter(x=>x.id!==id)
+    .sort((a,b)=>(a.titleKana||a.title).localeCompare(b.titleKana||b.title,'ja'));
+  const m=document.createElement('div');
+  m.className='modal'; m.id='menu';
+  m.innerHTML=`<div class="inner">
+    <div style="padding:13px 15px 8px;font-size:13.5px;font-weight:700">
+      「${esc(cur.title)}」の${cur.isbns.length}冊を、どのセットに入れますか</div>
+    <div style="padding:0 12px 10px">
+      <input id="mgq" placeholder="セット名で絞り込む"
+        style="width:100%;padding:9px 11px;border:1px solid var(--rule);border-radius:8px;background:var(--paper);outline:none;font-size:15px">
+    </div>
+    <div id="mglist" style="max-height:46vh;overflow:auto">${mergeRows(rows)}</div>
+    <button class="item" data-act="menuClose">キャンセル</button>
+  </div>`;
+  m.addEventListener('click',e=>{ if(e.target===m) m.remove(); });
+  document.body.appendChild(m);
+  const q=$('mgq');
+  q.addEventListener('input',()=>{
+    const k=normKey(q.value);
+    const list=rows.filter(x=>!k||normKey(x.title+' '+x.author).includes(k));
+    $('mglist').innerHTML=mergeRows(list);
+  });
+}
+function mergeRows(rows){
+  if(!rows.length) return '<div class="empty">見つかりません</div>';
+  return rows.slice(0,80).map(x=>`
+    <button class="row" style="grid-template-columns:1fr auto;padding:10px 14px"
+      data-act="doMerge" data-id="${esc(x.id)}">
+      <span><span class="title">${esc(x.title)}</span>
+        <span class="meta">${esc(x.author)}</span></span>
+      <span class="vol tnum">${x.isbns.length}<small>冊</small></span>
+    </button>`).join('');
+}
+
 function openMenu(){
   const m=document.createElement('div');
   m.className='modal'; m.id='menu';
@@ -1654,6 +1781,35 @@ document.addEventListener('click', async e=>{
     removeSeries(id); await save(); S.view='shelf'; render(); toast('削除しました'); return;
   }
 
+  if(act==='diag'){ runDiag(); return; }
+  if(act==='renameSeries'){
+    const sr=seriesOf(id); if(!sr) return;
+    const name=prompt('セット名',sr.title);
+    if(name==null) return;
+    const t=name.trim(); if(!t) return;
+    sr.title=t;
+    for(const isbn of sr.isbns){
+      const bk=bookOf(isbn);
+      if(bk&&bk.volume==null){ const v=volumeFromTitle(bk.title,t); if(v!=null) bk.volume=v; }
+    }
+    sortSeriesBooks(sr);
+    await save(); render(); toast('変更しました'); return;
+  }
+  if(act==='mergeSeries'){ openMerge(id); return; }
+  if(act==='doMerge'){
+    const target=id, from=S.detail;
+    $('menu')?.remove();
+    mergeSeries(from,target);
+    await save();
+    S.detail=target; S.view='series'; render(); scrollTo(0,0);
+    toast('まとめました'); return;
+  }
+  if(act==='tidyAuthors'){
+    let n=0;
+    for(const b of S.lib.books){ const c=cleanAuthor(b.author); if(c&&c!==b.author){ b.author=c; n++; } }
+    for(const sr of S.lib.series){ const c=cleanAuthor(sr.author); if(c&&c!==sr.author) sr.author=c; }
+    await save(); render(); toast(n?`${n}冊の著者名を整えました`:'整える箇所はありませんでした'); return;
+  }
   if(act==='menuScan'){ $('menu')?.remove(); openScan(); return; }
   if(act==='menuFind'){ $('menu')?.remove(); S.view='find'; render(); return; }
   if(act==='menuManual'){ $('menu')?.remove(); S.view='manual'; render(); return; }
