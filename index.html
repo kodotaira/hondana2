@@ -324,6 +324,7 @@ const VOL_TAIL = new RegExp(
 );
 function seriesTitleOf(title){
   const t=String(title||'').trim();
+  if(/^ISBN\s*\d{10,13}$/i.test(t)) return t;   // 書名未取得のものはそのまま
   const s=t.replace(VOL_TAIL,'').replace(/[\s　.．・:：]+$/,'').trim();
   return s.length>=1 ? s : t;
 }
@@ -599,7 +600,8 @@ function addBook(book){
   if(!settings().allowDuplicate && book.isbn13 && bookOf(book.isbn13)) return {added:false, reason:'すでに本棚にあります'};
   S.lib.books.push(book);
 
-  if(settings().autoSeries){
+  const placeholder=/^ISBN\s*\d+$/.test(String(book.title||'').trim());
+  if(settings().autoSeries && !placeholder){
     let s=findSeriesFor(book);
     if(s && s.standalone){ s.standalone=false; }
     if(!s){
@@ -613,6 +615,11 @@ function addBook(book){
     if(!s.isbns.includes(book.isbn13)) s.isbns.push(book.isbn13);
     if(!s.titleKana && book.titleKana) s.titleKana=book.titleKana;
     sortSeriesBooks(s);
+  }else if(placeholder){
+    // 書名が分からない本は単独で置いておく（あとで取り直せる）
+    S.lib.series.push({id:'u-'+book.isbn13, title:book.title, titleKana:'',
+      author:book.author, authorKana:'', publisher:book.publisher, label:book.label,
+      favorite:false, memo:'', standalone:true, isbns:[book.isbn13]});
   }
   return {added:true};
 }
@@ -680,7 +687,17 @@ function askCover(isbn){
     if(rakutenReady()){
       try{
         const it=await rakutenByIsbn(isbn);
-        if(it) url=rakutenCover(it)||null;
+        if(it){
+          url=rakutenCover(it)||null;
+          // よみがなも一緒に覚えておく（五十音の見出しに使う）
+          const kana=(it.titleKana||'').trim();
+          if(kana){
+            const b2=bookOf(isbn);
+            if(b2&&!b2.titleKana) b2.titleKana=kana;
+            const sr=S.lib.series.find(x=>x.isbns.includes(isbn));
+            if(sr&&!sr.titleKana) sr.titleKana=kana;
+          }
+        }
       }catch{}
     }
     if(!url){
@@ -930,8 +947,35 @@ function rakutenCover(it){
   const u=it.largeImageUrl||it.mediumImageUrl||it.smallImageUrl||'';
   return u.replace(/\?_ex=\d+x\d+$/,'?_ex=300x300');
 }
+/* 国立国会図書館サーチ。古い本や絶版本はここにしか無いことがある */
+async function fromNDL(isbn){
+  const ac=new AbortController();
+  const timer=setTimeout(()=>ac.abort(),8000);
+  let xml='';
+  try{
+    const r=await fetch(`https://ndlsearch.ndl.go.jp/api/opensearch?isbn=${isbn}&cnt=1`,{signal:ac.signal});
+    if(!r.ok) return null;
+    xml=await r.text();
+  } finally { clearTimeout(timer); }
+  const doc=new DOMParser().parseFromString(xml,'application/xml');
+  const item=doc.querySelector('item');
+  if(!item) return null;
+  const pick=n=>{
+    const el=[...item.children].find(c=>c.nodeName===n||c.localName===n.split(':').pop());
+    return el?el.textContent.trim():'';
+  };
+  const title=pick('title');
+  if(!title) return null;
+  const vol=pick('dcndl:volume')||pick('volume');
+  const full = vol && volumeOf(title)==null ? `${title}（${toInt(vol)??vol}）` : title;
+  return normBook({isbn13:isbn, title:full,
+    volume: toInt(vol) ?? volumeOf(full),
+    author:pick('author')||pick('dc:creator'),
+    publisher:pick('dc:publisher')||pick('publisher'),
+    releasedOn:(pick('dcterms:issued')||pick('pubDate')||'').slice(0,10).replace(/-/g,'/')});
+}
 async function lookupIsbn(isbn){
-  const sources=[fromRakuten, fromOpenBD, fromGoogle];
+  const sources=[fromRakuten, fromOpenBD, fromNDL, fromGoogle];
   for(const fn of sources){
     try{ const r=await fn(isbn); if(r&&r.title) return r; }catch{}
   }
@@ -1213,6 +1257,7 @@ function viewSeries(id){
   const noVol=books.filter(b=>b.volume==null);
 
   const rows=[];
+  const hasVol = g.min!=null && g.max!=null;
   if(g.before){
     rows.push(`<div class="row miss">
       <span class="missbox">1</span>
@@ -1221,7 +1266,7 @@ function viewSeries(id){
       <a class="buy" href="${esc(amazonSearch(s.title+' 1巻'))}" target="_blank" rel="noopener nofollow">探す</a>
     </div>`);
   }
-  for(let v=g.min; v<=g.max; v++){
+  for(let v=hasVol?g.min:1; hasVol&&v<=g.max; v++){
     const b=books.find(x=>x.volume===v);
     if(b){
       rows.push(`<button class="row" data-act="open" data-kind="book" data-id="${esc(b.isbn13)}">
@@ -1264,6 +1309,7 @@ function viewSeries(id){
       </div>
       <div class="acts">
         <button class="btn ghost" data-act="fav" data-id="${esc(s.id)}">${s.favorite?'★ お気に入り':'☆ お気に入り'}</button>
+        <button class="btn ghost" data-act="kana" data-id="${esc(s.id)}">よみがな${s.titleKana?'：'+esc(s.titleKana.slice(0,6)):'を設定'}</button>
         ${g.missing.length===0&&g.min===1?`<span class="btn ghost" style="border-color:var(--teal);color:var(--teal)">✓ そろった</span>`:''}
       </div>
     </div>
@@ -1832,6 +1878,16 @@ async function runDiag(){
   catch(e){ mark('openBD',false,'つながりません'); }
   put2();
 
+  // 国立国会図書館サーチ
+  try{ const r=await fromNDL(isbn); mark('国会図書館サーチ',!!r,r?esc(r.title):'該当なし'); }
+  catch(e){ mark('国会図書館サーチ',false,'つながりません'); }
+  put2();
+
+  // 国会図書館サーチ
+  try{ const r=await fromNDL(isbn); mark('国会図書館サーチ',!!r,r?esc(r.title):'該当なし'); }
+  catch(e){ mark('国会図書館サーチ',false,'つながりません'); }
+  put2();
+
   // Google Books
   try{ const r=await fromGoogle(isbn); mark('Google Books',!!r,r?esc(r.title):'該当なし'); }
   catch(e){ mark('Google Books',false,'つながりません'); }
@@ -1979,6 +2035,7 @@ document.addEventListener('click', async e=>{
     const f=await lookupIsbn(b.isbn13);
     if(!f){ toast('見つかりませんでした'); return; }
     b.title=f.title||b.title;
+    if(f.titleKana) b.titleKana=f.titleKana;
     b.author=f.author||b.author;
     b.publisher=f.publisher||b.publisher;
     b.label=f.label||b.label;
@@ -2008,6 +2065,14 @@ document.addEventListener('click', async e=>{
     }
     sortSeriesBooks(sr);
     await save(); render(); toast('変更しました'); return;
+  }
+  if(act==='kana'){
+    const sr=seriesOf(id); if(!sr) return;
+    const k=prompt('よみがな（カタカナ）。並び順の見出しに使います',sr.titleKana||'');
+    if(k==null) return;
+    sr.titleKana=k.trim();
+    for(const isbn of sr.isbns){ const bk=bookOf(isbn); if(bk&&!bk.titleKana) bk.titleKana=sr.titleKana; }
+    await save(); render(); toast('設定しました'); return;
   }
   if(act==='mergeSeries'){ openMerge(id); return; }
   if(act==='doMerge'){
