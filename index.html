@@ -771,16 +771,28 @@ function fetchJsonp(base,params,ms=8000){
     document.head.appendChild(sc);
   });
 }
-const RAKUTEN_BOOKS='https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404';
+/* 書籍検索は isbn、総合検索は isbnjan と、APIごとにパラメータ名が違う */
+const RAKUTEN_APIS=[
+  {url:'https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404',  key:'isbn'},
+  {url:'https://app.rakuten.co.jp/services/api/BooksTotal/Search/20170404', key:'isbnjan'},
+  {url:'https://app.rakuten.co.jp/services/api/BooksComic/Search/20170404', key:'isbn'},
+];
+const rakCache=new Map();
 
 /* 楽天ブックスからISBNで1冊引く */
 async function rakutenByIsbn(isbn){
   const id=settings().rakutenId.trim();
   if(!id) return null;
-  const j=await fetchJsonp(RAKUTEN_BOOKS,{applicationId:id, isbnjan:isbn});
-  const it=j?.Items?.[0]?.Item;
-  if(!it||!it.title) return null;
-  return it;
+  if(rakCache.has(isbn)) return rakCache.get(isbn);
+  for(const api of RAKUTEN_APIS){
+    try{
+      const j=await fetchJsonp(api.url,{applicationId:id, [api.key]:isbn});
+      const it=j?.Items?.[0]?.Item || j?.Items?.[0];
+      if(it&&it.title){ rakCache.set(isbn,it); return it; }
+    }catch{}
+  }
+  rakCache.set(isbn,null);
+  return null;
 }
 
 function normBook(x){
@@ -800,16 +812,19 @@ async function fromOpenBD(isbn){
   const j=await fetchJson(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
   const s=j?.[0]?.summary;
   if(!s||!s.title) return null;
-  const seriesName=s.series||'';
+  // series はレーベル名（ジャンプコミックス等）が入るので、書名には使わない
   const vol=s.volume?toInt(s.volume):volumeOf(s.title);
-  const title = seriesName && vol!=null ? `${seriesName}（${vol}）` : s.title;
-  return normBook({isbn13:s.isbn||isbn, title, volume:vol,
+  const base=String(s.title||'').trim();
+  const title = (vol!=null && volumeOf(base)==null) ? `${base}（${vol}）` : base;
+  return normBook({isbn13:s.isbn||isbn, title, volume:vol, label:s.series||'',
     author:s.author||'', publisher:s.publisher||'',
     releasedOn:(s.pubdate||'').replace(/(\d{4})(\d{2})(\d{2})?/, (m,y,mo,d)=>d?`${y}/${mo}/${d}`:`${y}/${mo}`),
     coverUrl:s.cover||''});
 }
 async function fromGoogle(isbn){
-  const j=await fetchJson(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&country=JP`);
+  let j=null;
+  try{ j=await fetchJson(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&country=JP`); }
+  catch{ j=await fetchJson(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`); }
   const v=j?.items?.[0]?.volumeInfo;
   if(!v?.title) return null;
   const title=[v.title,v.subtitle].filter(Boolean).join(' ');
@@ -1210,9 +1225,11 @@ function viewBook(isbn){
       ${b.memo?`<dt>メモ</dt><dd>${esc(b.memo)}</dd>`:''}
     </dl>
   </div>
-  <div class="sect">
+  <div class="sect" style="display:grid;gap:8px">
     <a class="btn wide" href="${esc(amazonItem(b))}" target="_blank" rel="noopener nofollow">Amazonで見る</a>
     ${affNote()}
+    <button class="btn ghost wide" data-act="refetch" data-id="${esc(b.isbn13)}">情報と表紙を取り直す</button>
+    <button class="btn ghost wide" data-act="renameBook" data-id="${esc(b.isbn13)}">書名を直す</button>
   </div>
   <div class="sect">
     <button class="btn danger wide" data-act="delBook" data-id="${esc(b.isbn13)}">この本を削除</button>
@@ -1664,7 +1681,7 @@ async function runDiag(){
     try{
       const it=await rakutenByIsbn(isbn);
       if(it) mark('楽天ブックス',true,esc(it.title));
-      else mark('楽天ブックス',false,'応答はあったが該当なし');
+      else mark('楽天ブックス',false,'応答はあったが該当なし（IDか許可ドメインの設定を確認）');
     }catch(e){ mark('楽天ブックス',false,'つながりません（'+(e.message||e)+'）'); }
   }
   put2();
@@ -1693,7 +1710,7 @@ async function runDiag(){
       if(it){ const u=rakutenCover(it); mark('楽天の書影',await tryImg(u)); shown=true; }
     }catch{}
   }
-  if(!shown) mark('楽天の書影',false,'IDが無いので試せません');
+  if(!shown) mark('楽天の書影',false,rid?'書誌が取れないので試せません':'アプリID未設定');
   mark('openBDの書影', await tryImg(`https://cover.openbd.jp/${isbn}.jpg`));
   put2();
 
@@ -1782,6 +1799,29 @@ document.addEventListener('click', async e=>{
   }
 
   if(act==='diag'){ runDiag(); return; }
+  if(act==='refetch'){
+    const b=bookOf(id); if(!b) return;
+    toast('取り直しています…');
+    const f=await lookupIsbn(b.isbn13);
+    if(!f){ toast('見つかりませんでした'); return; }
+    b.title=f.title||b.title;
+    b.author=f.author||b.author;
+    b.publisher=f.publisher||b.publisher;
+    b.label=f.label||b.label;
+    b.releasedOn=f.releasedOn||b.releasedOn;
+    if(f.volume!=null) b.volume=f.volume;
+    if(f.coverUrl){ b.coverUrl=f.coverUrl; urlCache.delete(b.isbn13); gbCache.delete(b.isbn13); }
+    await save(); render(); toast('取り直しました'); return;
+  }
+  if(act==='renameBook'){
+    const b=bookOf(id); if(!b) return;
+    const t=prompt('書名',b.title);
+    if(t==null) return;
+    const nt=t.trim(); if(!nt) return;
+    b.title=nt;
+    const v=volumeOf(nt); if(v!=null) b.volume=v;
+    await save(); render(); toast('直しました'); return;
+  }
   if(act==='renameSeries'){
     const sr=seriesOf(id); if(!sr) return;
     const name=prompt('セット名',sr.title);
